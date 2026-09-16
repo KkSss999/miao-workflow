@@ -48,28 +48,24 @@ export interface RunStore {
   listByStatus(status: RunStatus, limit?: number): Promise<WorkflowRun[]>;
 
   /**
-   * 原子抢占到期的 run。
+   * 原子抢占「可以推进」的 run。
    *
-   * 抢的条件：
-   *   - status 属于 CLAIMABLE_RUN_STATUSES
-   *   - 到点了：ACTIVE 看 wake_at（null 或已过期）；WAITING 必须有 wake_at 且已过 ——
-   *     等信号的 WAITING（wake_at IS NULL）抢了也没信号，只会空转
-   *   - 没有被别人持有的有效 lease
+   * 抢的条件（三条都要满足）：
+   *   1. status 属于 CLAIMABLE_RUN_STATUSES
+   *   2. **有活可干**：
+   *      - ACTIVE 状态：wake_at 为空或已过期（RETRYING 就是靠 wake_at 到点）
+   *      - WAITING：`wake_at` 已到点（delay / 等待超时），
+   *        **或者**有一条匹配当前挂起步骤 `wait_for` 的未消费信号（人类点了 Approve）
+   *   3. 没有被别人持有的有效 lease
    *
-   * Postgres 实现是这条（不需要 Redis）：
+   * 第 2 条里「有匹配的未消费信号」这个分支是刻意设计的：
+   * `engine.signal()` 只写一条信号、不碰 run，所以不存在「信号记下了但 run 没被叫醒」的崩溃窗口 ——
+   * run 会因为这条待消费信号自然变成可抢占。代价是最多一个轮询周期的延迟。
    *
-   * ```sql
-   * SELECT id FROM workflow_runs
-   *  WHERE status IN ('CREATED','RUNNING','RETRYING','WAITING')
-   *    AND (status <> 'WAITING' OR wake_at IS NOT NULL)
-   *    AND (wake_at IS NULL OR wake_at <= NOW())
-   *    AND (lease_expires_at IS NULL OR lease_expires_at < NOW())
-   *  ORDER BY created_at
-   *  FOR UPDATE SKIP LOCKED
-   *  LIMIT $1;
-   * ```
+   * 返回的 run 必须已经把 lease 写成本次 owner（必须和抢占在同一条语句/事务里完成）。
    *
-   * 返回的 run 必须已经把 lease 写成本次 owner。
+   * **只写 lease，不改 status**：状态语义由 engine 单独负责。claim 顺手把 status 改成 RUNNING
+   * 会抹掉 `CREATED` / `WAITING` 这两个信息，engine 就分不清「还没开始」「在等信号」了。
    */
   claimDue(options: ClaimOptions): Promise<WorkflowRun[]>;
 

@@ -35,7 +35,25 @@ await client.start("intake-to-action", { input: { intakeId: "INT-1024" } });
 
 所以 Core 根本不需要知道什么是 Resend。
 
+## 跑起来的写法
+
+```ts
+const storage = new MemoryWorkflowStorage();          // 或 PostgresWorkflowStorage
+const engine = new WorkflowEngine({ storage, registry: registerIntakeOps() });
+const client = new WorkflowClient(engine);
+const worker = new WorkflowWorker({ engine, concurrency: 16 });
+worker.start();
+
+const run = await client.start(intakeToAction, { input: { intakeId: "INT-1024" } });
+
+// 几天后，人类在 UI 上点 Approve —— 请求路径只写一条信号
+await client.signal(run.id, "approval", { decision: "approve" });
+```
+
 ## 状态
 
-Engine 还在 Phase A，这个例子目前只保证**能定义、能注册、能通过类型检查**，
-还跑不起来。等 `WorkflowEngine.start/tick` 落地后，这里会变成可执行 demo。
+✅ **完整链路已经跑通**：分类 → 人工复核 → 审批 → 建 lead → 发邮件。
+
+真正的可执行版本在 [`tests/examples.test.ts`](../../tests/examples.test.ts)：
+那里断言了整条链路的**审计时间线**（23 条事件），包括两次挂起与两次恢复。
+等 IntakeOps 真实接入时，只需把这里 handler 里的注释换成真实的 service 调用。

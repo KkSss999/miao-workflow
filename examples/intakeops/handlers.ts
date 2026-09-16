@@ -21,7 +21,12 @@ export interface TriageOutput {
   summary: string;
 }
 
-/** AI 分类。带重试的步骤必须幂等（这里只是读输入 + 写 context，天然幂等）。 */
+/**
+ * AI 分类。带重试的步骤必须幂等（这里只是读输入 + 写 context，天然幂等）。
+ *
+ * 注意一个约定：**run.input 只有首个 step 看得到**（后面的 step，input 是上一步的 output）。
+ * 所以首个 step 应该把「后面都要用的东西」patch 进 context —— 这里就是 intakeId。
+ */
 export const triageHandler: StepHandler<{ model?: string }, TriageOutput> = {
   async execute(context, config) {
     const model = config?.model ?? "deepseek-flash";
@@ -35,29 +40,45 @@ export const triageHandler: StepHandler<{ model?: string }, TriageOutput> = {
       status: "completed",
       output: { confidence, priority, summary: `${intakeId} 的请求已完成分类` },
       // patch 会合并进 context，供后续 guard 与 step 读取
-      patch: { confidence, priority },
+      patch: { intakeId, confidence, priority },
     };
   },
 };
 
-/** 人工复核：挂起，等 "review" 信号。没有 Promise 挂在那里，进程可以随便重启。 */
+/**
+ * 人工复核：挂起，等 "review" 信号。
+ *
+ * 没有 Promise 挂在那里，进程可以随便重启 —— 几天后人类点一下，
+ * run 会被重新执行一遍，这次 `context.resume` 有值。
+ */
 export const manualReviewHandler: StepHandler = {
-  async execute(): Promise<StepResult> {
-    return { status: "waiting", waitFor: "review" };
+  async execute(context): Promise<StepResult> {
+    if (context.resume === undefined) return { status: "waiting", waitFor: "review" };
+    return {
+      status: "completed",
+      output: context.resume.payload ?? null,
+      patch: { reviewedBy: reviewerOf(context.resume.payload) },
+    };
   },
 };
 
 /** 人工审批：等 "approval" 信号。 */
 export const approvalHandler: StepHandler = {
-  async execute(): Promise<StepResult> {
-    return { status: "waiting", waitFor: "approval" };
+  async execute(context): Promise<StepResult> {
+    if (context.resume === undefined) return { status: "waiting", waitFor: "approval" };
+    return {
+      status: "completed",
+      output: context.resume.payload ?? null,
+      patch: { approved: true },
+    };
   },
 };
 
 /** 建 lead：把现有 LeadService 包一层，不重写业务逻辑。 */
 export const leadHandler: StepHandler<{ source: string }> = {
-  async execute(context, config) {
-    const intakeId = readIntakeId(context.input);
+  async execute(ctx, config) {
+    // intakeId 是首个 step patch 进 context 的（不是从 input 来的，input 是上一步的 output）
+    const intakeId = typeof ctx.context["intakeId"] === "string" ? ctx.context["intakeId"] : "unknown-intake";
 
     // 真实实现：const lead = await leadService.create({ intakeId, source: config.source })
     const leadId = `lead_${intakeId}`;
@@ -108,6 +129,12 @@ export function registerIntakeOps(registry: Registry = new Registry()): Registry
       // Definition 里只能写 "confidence.low"，不能写 JS 表达式 —— 避免造一个 sandbox
       "confidence.low": ({ context }) => Number(context["confidence"] ?? 1) < 0.75,
     });
+}
+
+function reviewerOf(payload: JsonValue | undefined): string {
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return "unknown";
+  const reviewer = payload["reviewer"];
+  return typeof reviewer === "string" ? reviewer : "unknown";
 }
 
 function readIntakeId(input: JsonValue | undefined): string {

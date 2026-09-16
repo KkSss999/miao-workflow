@@ -248,8 +248,8 @@ RBAC · 多租户 · Connector 市场 · Redis 依赖 · Kubernetes · 分布式
 |---|---|---|---|
 | **A** | Definition · Registry · Handler · Transition · Engine · 事件流 | `A → B → C` + 条件分支 + 崩溃不重放副作用 | ✅ 完成 |
 | **B** | PostgresStorage · Run/StepRun/Events · 版本化 | `kill -9` → 重启 → 继续 | ✅ 完成 |
-| **C** | Retry 端到端 · Lease 接入 · Crash Recovery · UNKNOWN | 崩溃与重复都不出错 | — |
-| **D** | Signal · Wait · Resume · Delay · Cancel | **Core V1 完成** | — |
+| **C** | Retry 端到端 · Lease · Crash Recovery · UNKNOWN | 崩溃与重复都不出错 | ✅ 完成 |
+| **D** | Signal · Wait · Resume · Delay · Cancel | **Core V1 完成** | ✅ 完成 |
 | **F** | WASM handler 宿主（独立扩展包） | 第三方打包一个 wasm 就接进来 | 设计已定 |
 
 E（包住 IntakeOps）不再作为阶段 —— D 完成之后顺手验证即可。
@@ -295,6 +295,63 @@ current_step_run_id 我正在处理哪一条 step run 记录
 
 `visit` 完全由已落库的记录推导（`(latest?.visit ?? 0) + 1`），所以同一个 visit 内的重试复用同一条记录，
 回边（A→B→A）则自然得到新的 visit，幂等键不会撞车。
+
+## 挂起与恢复（Phase D）
+
+### 信号只有一个写操作
+
+`engine.signal()` 只做一件事：**append 一条 signal**（外加一条审计事件）。它不碰 run。
+
+那 run 怎么被叫醒？靠 `claimDue` 里的一个 EXISTS 条件：
+
+```sql
+OR (status = 'WAITING' AND (
+     (wake_at IS NOT NULL AND wake_at <= NOW())          -- delay / 等待超时
+  OR EXISTS (SELECT 1 FROM workflow_signals s            -- 人类点了 Approve
+               JOIN workflow_step_runs sr ON sr.id = workflow_runs.current_step_run_id
+              WHERE s.run_id = workflow_runs.id
+                AND s.name = sr.wait_for
+                AND s.consumed_at IS NULL)
+))
+```
+
+这样做的好处：**不存在「信号记下了但 run 没被叫醒」的半完成状态**。
+如果反过来（先改 run 状态再写信号，或分两个事务），崩溃点就会丢信号或丢唤醒。
+代价是最多一个轮询周期的延迟（默认 1s）。
+
+### 恢复契约：同样的代码跑两次
+
+handler 只有一种写法：
+
+```ts
+async execute(ctx) {
+  if (ctx.resume === undefined) return { status: "waiting", waitFor: "approval" };
+  return { status: "completed", output: ctx.resume.payload };
+}
+```
+
+`ctx.resume` 只有「被叫醒重新执行」时才有值，所以 handler 必须幂等 ——
+这跟整个引擎的 at-least-once 语义是一致的，没有第二套规则。
+
+### 两个容易踩的坑（都踩过了）
+
+1. **挂起信息要在失败之后保留。** 被信号叫醒的那次尝试如果失败了，重试时不能再要一次信号 ——
+   外部世界不会自己再来一遍。所以 `waitFor` / `waitPayload` / `wakeAt` 会跟着 step run 走，
+   每次尝试都能重建出 `ctx.resume`。
+2. **别用 `run.status` 判断「是不是在挂起」。** claim 会把状态改成 RUNNING（那是「归我处理」的意思），
+   判断依据应该是**当前 step run 的 `status === 'WAITING'` + `waitFor`**。
+
+### 取消是状态层面的
+
+`cancel()` 把 run 置为 CANCELLED 并释放 lease。正在跑的 handler **不会被掐断**（跨进程做不到）——
+这一点必须诚实：取消保证「不再有新步骤被推进」，副作用层面靠幂等键与 reconciliation 兜。
+
+### UNKNOWN 的人工入口
+
+`engine.reconcile(runId, "retry" | "abandon")`：
+
+- `retry`：同一条 step run、同一个 visit、**同一个幂等键**重跑 —— 幂等键不变是关键，下游才能去重
+- `abandon`：放弃，置为 CANCELLED（保留 error 供审计）
 
 ## 扩展：WASM handler 宿主（Phase F）
 

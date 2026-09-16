@@ -4,6 +4,7 @@ import { hashDefinition } from "../definition/validation.js";
 import { defineWorkflow, type WorkflowDefinition, type WorkflowDefinitionInput } from "../definition/workflow.js";
 import type { StepDefinition, StepId } from "../definition/step.js";
 import type { JsonObject, JsonValue } from "../json.js";
+import { RESERVED_HANDLERS, createCompleteHandler, createDelayHandler, type StepResume } from "../runtime/builtins.js";
 import type { WorkflowEventType } from "../runtime/events.js";
 import { computeBackoffMs, normalizeRetryPolicy, shouldRetry } from "../runtime/retry.js";
 import { isTerminalRunStatus, type RunStatus, type WorkflowRun, type WorkflowRunPatch } from "../runtime/run.js";
@@ -12,8 +13,8 @@ import type { WorkflowStorage } from "../storage/interface.js";
 import {
   DefinitionNotFoundError,
   LeaseLostError,
-  NotImplementedError,
   RunNotFoundError,
+  RunNotActiveError,
   ValidationError,
 } from "./errors.js";
 import { Registry, assertRegistryCoverage, createRegistry } from "./registry.js";
@@ -55,10 +56,13 @@ export interface TickOptions {
   /**
    * 持有该 run lease 的 worker 标识。
    *
-   * - 传了：tick 前会确认 lease 还是自己的，撞上限时主动 release（交给别的 worker）
-   * - 不传：不做 lease 管理（进程内直接跑 / 测试用）
+   * 传了就会**每一步开始前续租**；续不动说明 lease 被别人抢走，立刻抛 LeaseLostError 停止推进。
+   * 不传 = 不做 lease 管理（进程内直接跑 / 测试用）。
+   *
+   * 传 owner 必须同时传 leaseMs —— 否则续租的租期是多少？宁可不猜。
    */
   owner?: string;
+  leaseMs?: number;
 }
 
 export interface TickResult {
@@ -67,10 +71,23 @@ export interface TickResult {
   status: RunStatus;
 }
 
+/** UNKNOWN 的人工 / 系统 reconciliation 决定。 */
+export type ReconcileDecision =
+  /** 确认外部没成功（或对方能按幂等键去重）→ 用**同一个幂等键**重跑 */
+  | "retry"
+  /** 放弃这个 run */
+  | "abandon";
+
+interface WaitResolution {
+  resume: StepResume;
+  stepId: StepId;
+  via: "signal" | "delay";
+}
+
 /**
  * 引擎 = Definition + Storage + Registry。
  *
- * 它只做四件事：发布定义、起 run、推进 run、处理信号。
+ * 它只做这些事：发布定义、起 run、推进 run、送到信号、取消、处理未知结果。
  * 不认识 Intake / Lead / Slack / Email，也不认识 OpenAI。
  */
 export class WorkflowEngine {
@@ -78,7 +95,9 @@ export class WorkflowEngine {
   readonly registry: Registry;
   readonly limits: EngineLimits;
 
-  readonly #now: () => Date;
+  /** 引擎的时钟。注入它 = 时间在测试里可控；worker 的 lease 也用同一个时钟。 */
+  readonly now: () => Date;
+
   readonly #newId: () => string;
   readonly #random: () => number;
   readonly #runner: StepRunner;
@@ -87,14 +106,22 @@ export class WorkflowEngine {
     this.storage = options.storage;
     this.registry = options.registry ?? createRegistry();
     this.limits = { ...DEFAULT_ENGINE_LIMITS, ...options.limits };
-    this.#now = options.now ?? (() => new Date());
+    this.now = options.now ?? (() => new Date());
     this.#newId = options.newId ?? (() => randomUUID());
     this.#random = options.random ?? (() => Math.random());
     this.#runner = new StepRunner({
       registry: this.registry,
       storage: this.storage,
-      now: this.#now,
+      now: this.now,
     });
+
+    // 内置 handler：Runtime 自己的能力。业务想覆盖就覆盖（先注册者胜）。
+    if (!this.registry.has(RESERVED_HANDLERS.delay)) {
+      this.registry.register(RESERVED_HANDLERS.delay, createDelayHandler(this.now));
+    }
+    if (!this.registry.has(RESERVED_HANDLERS.complete)) {
+      this.registry.register(RESERVED_HANDLERS.complete, createCompleteHandler());
+    }
   }
 
   /**
@@ -162,30 +189,137 @@ export class WorkflowEngine {
   }
 
   /**
+   * 送到外部信号 —— 人类审批、webhook 回调、别的系统通知，全都是这个。
+   *
+   * 只做一件事：**落库**（外加一条审计事件）。
+   *
+   * 刻意不在这里顺手推进 run：
+   * - 落库是唯一的写操作 → 不存在「信号已记下但 run 没被叫醒」的崩溃窗口
+   * - 执行永远发生在 worker 里，请求路径不干重活
+   *
+   * run 会被「有匹配的未消费信号」这个条件捞起来（见 storage 的 claimDue）。
+   */
+  async signal(runId: string, name: string, payload?: JsonValue): Promise<void> {
+    const run = await this.#requireRun(runId);
+    if (isTerminalRunStatus(run.status)) throw new RunNotActiveError(runId, run.status);
+
+    await this.storage.signals.append({
+      id: this.#newId(),
+      runId,
+      name,
+      payload,
+      createdAt: this.#nowIso(),
+      consumedAt: null,
+    });
+
+    await this.#emit(runId, null, "signal.received", {
+      name,
+      ...(payload === undefined ? {} : { payload }),
+    });
+  }
+
+  /**
+   * 取消 run。
+   *
+   * 正在跑的 handler 不会被掐断（跨进程做不到）—— 这一点必须诚实：
+   * 取消是**状态层面**的，副作用层面靠幂等键与 reconciliation 兜。
+   */
+  async cancel(runId: string): Promise<WorkflowRun> {
+    const run = await this.#requireRun(runId);
+    if (isTerminalRunStatus(run.status)) throw new RunNotActiveError(runId, run.status);
+
+    const at = this.#nowIso();
+    const cancelled = await this.#setRun(run, { status: "CANCELLED", wakeAt: null, completedAt: at });
+    if (run.leaseOwner !== null) await this.storage.runs.releaseLease(runId, run.leaseOwner);
+
+    await this.#emit(runId, null, "workflow.cancelled", {
+      ...(run.currentStepId === null ? {} : { stepId: run.currentStepId }),
+    });
+    return cancelled;
+  }
+
+  /**
+   * UNKNOWN 的人工 / 系统 reconciliation 入口。
+   *
+   * UNKNOWN 意味着「请求超时了，但对方到底做没做不知道」——自动重试会造成重复副作用，
+   * 所以必须有人（或对账系统）看一眼再决定：
+   *
+   * - `"retry"`：确认没成功（或对方支持幂等键去重）→ 同一条 step run、同一个 visit、
+   *   **同一个幂等键**重跑 —— 幂等键不变是关键，下游才能去重
+   * - `"abandon"`：放弃，run 置为 CANCELLED（保留 error 供审计）
+   */
+  async reconcile(runId: string, decision: ReconcileDecision): Promise<WorkflowRun> {
+    const run = await this.#requireRun(runId);
+    if (run.status !== "FAILED" || run.error?.code !== "UNKNOWN_OUTCOME") {
+      throw new RunNotActiveError(runId, run.status);
+    }
+
+    if (decision === "abandon") {
+      const at = this.#nowIso();
+      const abandoned = await this.#setRun(run, { status: "CANCELLED", wakeAt: null, completedAt: at });
+      await this.#emit(runId, null, "workflow.cancelled", { reason: "reconcile.abandon" });
+      return abandoned;
+    }
+
+    const resumed = await this.#setRun(run, { status: "RUNNING", error: null, wakeAt: null, completedAt: null });
+    await this.#emit(runId, null, "workflow.resumed", {
+      reason: "reconcile.retry",
+      ...(run.currentStepId === null ? {} : { stepId: run.currentStepId }),
+    });
+    return resumed;
+  }
+
+  /**
    * 推进一个 run：
    *
    * ```
-   * claim（由 Worker 负责）→ execute step → persist → patch context → transition → 继续
+   * claim（由 Worker 负责）→ 解挂起（signal / delay）→ execute step → persist
+   *   → patch context → transition → 继续
    * ```
    *
    * 直到 WAITING / 终态 / 撞到 maxStepsPerTick。
-   *
-   * 只做顺序 + 条件分支（V1 不支持并行与循环，回边只用于防死循环测试）。
    */
   async tick(runId: string, options: TickOptions = {}): Promise<TickResult> {
     let run = await this.#requireRun(runId);
     if (isTerminalRunStatus(run.status)) return { steps: 0, status: run.status };
-    // Phase D 才会消费 signal；现在 WAITING 就是「等」
-    if (run.status === "WAITING") return { steps: 0, status: run.status };
 
-    const { owner } = options;
-    if (owner !== undefined && run.leaseOwner !== null && run.leaseOwner !== owner) {
-      throw new LeaseLostError(runId);
+    const { owner, leaseMs } = options;
+    if (owner !== undefined) {
+      if (leaseMs === undefined) {
+        throw new ValidationError("tick 传了 owner 就必须同时传 leaseMs（续租要用）");
+      }
+      if (run.leaseOwner !== null && run.leaseOwner !== owner) throw new LeaseLostError(runId);
     }
 
     const definition = await this.#requireDefinitionVersion(run);
 
-    if (run.status === "CREATED") {
+    // 挂起解不解得开？
+    //
+    // 注意：判断依据是**当前 step run 的状态**，不是 run.status ——
+    // 因为 claim 会把 WAITING 改写成 RUNNING（「这个 run 现在归我处理」），
+    // 如果看 run.status，就永远发现不了「这一步其实在等信号」。
+    let pendingResume: StepResume | undefined;
+    const waitingStep = await this.#activeStepRun(run);
+
+    if (waitingStep !== null && waitingStep.status === "WAITING" && waitingStep.waitFor !== null) {
+      const resolution = await this.#resolveWait(run, waitingStep);
+      if (resolution === null) {
+        // 还没等到（比如信号被别人先消费了）→ 放回 WAITING，交还 lease，不空转
+        if (run.status !== "WAITING") {
+          run = await this.#setRun(run, { status: "WAITING", wakeAt: waitingStep.wakeAt });
+        }
+        if (owner !== undefined) await this.storage.runs.releaseLease(run.id, owner);
+        return { steps: 0, status: "WAITING" };
+      }
+
+      pendingResume = resolution.resume;
+      run = await this.#setRun(run, { status: "RUNNING", wakeAt: null });
+      await this.#emit(run.id, null, "workflow.resumed", {
+        stepId: resolution.stepId,
+        waitFor: resolution.resume.waitFor,
+        via: resolution.via,
+      });
+    } else if (run.status === "CREATED") {
       run = await this.#setRun(run, { status: "RUNNING" });
       await this.#emit(run.id, null, "workflow.started", { start: definition.start });
     }
@@ -200,6 +334,12 @@ export class WorkflowEngine {
         });
       }
 
+      // lease 还握在自己手里吗？（长 handler 由心跳兜，这里负责「边界处」的一致性检查）
+      if (owner !== undefined && leaseMs !== undefined) {
+        const renewed = await this.storage.runs.renewLease(run.id, owner, leaseMs);
+        if (!renewed) throw new LeaseLostError(run.id);
+      }
+
       const history = await this.storage.steps.listByRun(run.id);
       const active =
         run.currentStepRunId === null
@@ -211,35 +351,32 @@ export class WorkflowEngine {
       );
       const input: JsonValue | undefined = previous === null ? run.input : previous.output;
 
-      // 崩溃恢复：指针指向的这一步已经成功过 → 不重放副作用，只重放状态（patch 存在 step run 里）
+      // 崩溃恢复：指针指向的这一步已经成功过 → 不重放副作用，只重放状态（patch）
       if (active !== null && active.status === "COMPLETED") {
         steps += 1;
-        const advanced = await this.#advance({
-          run,
-          stepId,
-          step,
-          output: active.output,
-          patch: active.patch,
-        });
+        const advanced = await this.#advance({ run, stepId, step, output: active.output, patch: active.patch });
         if (isTerminalRunStatus(advanced.status)) return { steps, status: advanced.status };
         run = advanced;
         continue;
       }
 
       const resuming = active !== null;
-      // visit 完全由已落库的记录推导：同一次访问内重试复用，回边则 +1
       const visit = resuming ? active.visit : (latest?.visit ?? 0) + 1;
-      // 指针可能悬空（执行中崩过）—— 复用同一个 id，保证幂等键前后一致
       const stepRunId = resuming ? active.id : (run.currentStepRunId ?? this.#newId());
 
+      // 解挂起只对「当前这一步」生效；之后的步骤回到正常状态
+      const resume = pendingResume ?? reconstructResume(active);
+      pendingResume = undefined;
+
       if (run.currentStepRunId !== stepRunId) {
-        // 先把「我正要做这个」写下来，这样崩在中间时恢复路径能识别出来
+        // 先把「我正要做这个」写下来，崩在中间时恢复路径才认得出来
         run = await this.#setRun(run, { status: "RUNNING", currentStepRunId: stepRunId });
       }
 
       await this.#emit(run.id, stepId, "step.started", {
         visit,
         attempt: (resuming ? active.attempt : 0) + 1,
+        ...(resume === undefined ? {} : { resumed: true }),
       });
 
       const outcome = await this.#runner.execute({
@@ -250,6 +387,7 @@ export class WorkflowEngine {
         stepRunId,
         input,
         existing: resuming ? active : null,
+        ...(resume === undefined ? {} : { resume }),
       });
       steps += 1;
 
@@ -275,12 +413,15 @@ export class WorkflowEngine {
             currentStepId: stepId,
           });
           await this.#emit(run.id, stepId, "step.waiting", { visit, waitFor: outcome.stepRun.waitFor });
-          await this.#emit(run.id, null, "workflow.waiting", { stepId, waitFor: outcome.stepRun.waitFor });
+          await this.#emit(run.id, null, "workflow.waiting", {
+            stepId,
+            waitFor: outcome.stepRun.waitFor,
+          });
           return { steps, status: run.status };
         }
 
         case "UNKNOWN": {
-          // 外部结果未知：不自动重试，等人工 / 系统 reconciliation
+          // 外部结果未知：不自动重试，等人工 / 系统 reconciliation（engine.reconcile）
           run = await this.#fail(run, stepId, outcome.stepRun);
           await this.#emit(run.id, stepId, "step.unknown", { visit, attempt: outcome.stepRun.attempt });
           await this.#emit(run.id, null, "workflow.failed", {
@@ -302,7 +443,11 @@ export class WorkflowEngine {
               currentStepId: stepId,
             });
             await this.#emit(run.id, stepId, "step.retrying", { attempt: outcome.stepRun.attempt, delayMs });
-            await this.#emit(run.id, null, "workflow.retrying", { stepId, attempt: outcome.stepRun.attempt, delayMs });
+            await this.#emit(run.id, null, "workflow.retrying", {
+              stepId,
+              attempt: outcome.stepRun.attempt,
+              delayMs,
+            });
             return { steps, status: run.status };
           }
 
@@ -327,18 +472,56 @@ export class WorkflowEngine {
   }
 
   /**
-   * 送到外部信号（人类审批、webhook 回调…）。
-   * 先落库再 wake，所以进程崩了也不丢。
+   * 挂起解不解得开？
    *
-   * Phase D 实现。
+   * 两个条件，先到先得：
+   *   1. 有匹配的未消费信号 → 消费掉（落进 step run 的 waitPayload，重试时还能拿到）
+   *   2. `wake_at` 到点（delay / 等待超时）
    */
-  async signal(_runId: string, _name: string, _payload?: JsonValue): Promise<void> {
-    throw new NotImplementedError("WorkflowEngine.signal（Phase D）");
+  async #resolveWait(run: WorkflowRun, active: StepRun): Promise<WaitResolution | null> {
+    const at = this.#nowIso();
+    const waitFor = active.waitFor;
+
+    if (waitFor !== null) {
+      const signal = await this.storage.signals.consumeNext(run.id, waitFor, at);
+      if (signal !== null) {
+        // 落库：万一接下来这一步失败重试，信号还在
+        await this.storage.steps.update(active.id, { waitPayload: signal.payload });
+        return {
+          stepId: active.stepId,
+          via: "signal",
+          resume: {
+            waitFor,
+            ...(signal.payload === undefined ? {} : { payload: signal.payload }),
+          },
+        };
+      }
+
+      if (active.wakeAt !== null && active.wakeAt <= at) {
+        return {
+          stepId: active.stepId,
+          via: "delay",
+          resume: { waitFor, wakeAt: active.wakeAt },
+        };
+      }
+      return null;
+    }
+
+    // 没有 waitFor 的挂起（正常不会出现）：run 的 wake_at 到点就往前推
+    if (run.wakeAt !== null && run.wakeAt <= at) {
+      return {
+        stepId: run.currentStepId ?? "",
+        via: "delay",
+        resume: { waitFor: "unknown", wakeAt: run.wakeAt },
+      };
+    }
+    return null;
   }
 
-  /** Phase D 实现。 */
-  async cancel(_runId: string): Promise<void> {
-    throw new NotImplementedError("WorkflowEngine.cancel（Phase D）");
+  /** run 指针指向的那条 step run（没有就是 null）。 */
+  async #activeStepRun(run: WorkflowRun): Promise<StepRun | null> {
+    if (run.currentStepRunId === null) return null;
+    return this.storage.steps.get(run.currentStepRunId);
   }
 
   /** 执行一步之后决定下一步：合并 patch → resolveNextStep → 落 run 状态。 */
@@ -431,11 +614,11 @@ export class WorkflowEngine {
   }
 
   #nowIso(): string {
-    return this.#now().toISOString();
+    return this.now().toISOString();
   }
 
   #isoAfter(delayMs: number): string {
-    return new Date(this.#now().getTime() + delayMs).toISOString();
+    return new Date(this.now().getTime() + delayMs).toISOString();
   }
 }
 
@@ -463,8 +646,12 @@ export class WorkflowClient {
     return this.engine.signal(runId, name, payload);
   }
 
-  async cancel(runId: string): Promise<void> {
+  async cancel(runId: string): Promise<WorkflowRun> {
     return this.engine.cancel(runId);
+  }
+
+  async reconcile(runId: string, decision: ReconcileDecision): Promise<WorkflowRun> {
+    return this.engine.reconcile(runId, decision);
   }
 
   async get(runId: string): Promise<WorkflowRun> {
@@ -474,4 +661,21 @@ export class WorkflowClient {
 
 function lastOf<T>(items: T[]): T | null {
   return items.length === 0 ? null : (items[items.length - 1] as T);
+}
+
+/**
+ * 重试 / 恢复时把上一轮挂起的信息还给 handler。
+ *
+ * 这一步很关键：假如下游在「被叫醒之后」失败了，重试时不能再要一次信号 ——
+ * 信号是外部世界给的，不会自己再来一遍。所以 payload 存在 step run 上。
+ */
+function reconstructResume(active: StepRun | null): StepResume | undefined {
+  // 只要这一步「等过东西」，之后的每次尝试都应该拿到同样的 resume 信息
+  if (active === null || active.waitFor === null) return undefined;
+
+  return {
+    waitFor: active.waitFor,
+    ...(active.wakeAt === null ? {} : { wakeAt: active.wakeAt }),
+    ...(active.waitPayload === undefined ? {} : { payload: active.waitPayload }),
+  };
 }

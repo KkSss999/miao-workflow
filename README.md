@@ -58,9 +58,24 @@ engine.registry
   .guard("confidence.low", ({ context }) => Number(context["confidence"] ?? 1) < 0.75);
 
 const client = new WorkflowClient(engine);
+const worker = new WorkflowWorker({ engine, concurrency: 16 });
 
-await client.start(workflow, { input: { intakeId: "INT-1024" } });
-await client.signal(runId, "approval", { decision: "approve" });
+const run = await client.start(workflow, { input: { intakeId: "INT-1024" } });
+worker.start();                                   // 后台轮询推进
+
+// 几天后人类点了 Approve（web 请求里只写一条信号，不执行任何业务）
+await client.signal(run.id, "approval", { decision: "approve" });
+```
+
+handler 的挂起写法只有一种形状 —— **同样的代码跑两次**：
+
+```ts
+const approvalHandler: StepHandler = {
+  async execute(ctx) {
+    if (ctx.resume === undefined) return { status: "waiting", waitFor: "approval" };
+    return { status: "completed", output: ctx.resume.payload, patch: { approved: true } };
+  },
+};
 ```
 
 定义里**没有一个字**提到 Resend / HubSpot / Slack / OpenAI。
@@ -68,14 +83,16 @@ Core 只知道 `Workflow · Run · Step · Transition · Handler · Signal · Re
 
 ## 状态
 
-**Phase A 已完成**：`engine.start` / `engine.tick` / `StepRunner.execute` 是真的 ——
-顺序执行、条件分支、崩溃恢复（不重放副作用）、版本绑定、防死循环都跑通了。
+**V1 的核心已经能跑了**（130 个测试；Postgres 部分需要 Docker）：
 
-**Phase B 已完成**：`PostgresWorkflowStorage` 五个 Store 全部实现，`migrate()` 幂等建表，
-`claimDue` 用一条 `FOR UPDATE SKIP LOCKED` 的 `UPDATE ... RETURNING` 完成抢锁 + 写 lease。
-Memory 与 Postgres 跑**同一套 conformance 断言**（101 个测试），所以「内存测、Postgres 上生产」不是空话。
+| Phase | 内容 | 状态 |
+|---|---|---|
+| A | Engine + StepRunner + 事件流 | ✅ 顺序执行 · 条件分支 · 崩溃恢复不重放副作用 · 版本绑定 · 防死循环 |
+| B | PostgresStorage | ✅ 五表 · JSONB 映射 · `SKIP LOCKED` 抢占；与 memory 跑同一套 conformance |
+| C | 可靠执行 | ✅ Worker 抢占循环 · lease 心跳 · 真·crash recovery · 失败隔离 · UNKNOWN 的 reconcile |
+| D | 异步与信号 | ✅ signal/wait/resume · `workflow.delay` · cancel · 等待超时 |
 
-Worker 抢占循环、signal/delay 仍是桩，按 Phase 填充。
+人审批可以等三天、delay 可以等两周 —— **等待期间不占进程、不挂 Promise，进程随便 kill -9**。
 
 | 模块 | 状态 | Phase |
 |---|---|---|
@@ -95,8 +112,9 @@ Worker 抢占循环、signal/delay 仍是桩，按 Phase 填充。
 | Retry 决策（可重试 → RETRYING + wake_at） | ✅ 实现（策略层测试在 C） | A |
 | `PostgresWorkflowStorage`（五表 · JSONB 映射 · `SKIP LOCKED` 抢占） | ✅ 实现 | A/B |
 | Storage conformance：Memory 与 Postgres 同一套断言 | ✅ 实现 | B |
-| `WorkflowWorker.tick` | 🚧 桩 | C |
-| signal / cancel / delay | 🚧 桩 | D |
+| `WorkflowWorker`（抢占 · 心跳 · drain） | ✅ 实现 | C |
+| signal / wait / resume / `workflow.delay` / cancel | ✅ 实现 | D |
+| `engine.reconcile`（UNKNOWN 的人工入口） | ✅ 实现 | C |
 | WASM handler 宿主（第三方扩展） | 💡 设计已定 | F |
 | IntakeOps 集成示例 | ✅ 走到人工审批挂起；signal 待 D | — |
 
@@ -168,11 +186,12 @@ Connector 市场 · Redis 依赖 · Kubernetes · 分布式 scheduler · AI Agen
 |---|---|---|
 | **A** | Engine + StepRunner + 事件流 | ✅ **已完成**：`A → B → C`、条件分支、崩溃恢复、防死循环 |
 | **B** | PostgresStorage + 版本化 + events | ✅ **已完成**：与 memory 同一套 conformance 全绿（真容器） |
-| **C** | Retry 端到端 / Lease 接入 / Crash Recovery / UNKNOWN 语义 | 崩溃与重复都不出错 |
-| **D** | Signal / Wait / Resume / Delay / Cancel | **Core V1 完成** |
+| **C** | Retry 端到端 / Lease / Crash Recovery / UNKNOWN 语义 | ✅ **已完成** |
+| **D** | Signal / Wait / Resume / Delay / Cancel | ✅ **已完成** —— Core V1 闭环 |
 | **F** | WASM handler 宿主（独立扩展包） | 第三方打包一个 wasm 就能接进来 |
 
-E（包住 IntakeOps）不再单独成阶段 —— 它退化成 D 完成后的顺手验证。
+E（包住 IntakeOps）不再单独成阶段 —— 它已经是 `tests/examples.test.ts` 里的端到端用例
+（分类 → 人工复核 → 审批 → 建 lead → 发邮件，全程靠信号推进）。
 
 **为什么 wasm 是 extension 而不是 Core**：Core 只认 `StepHandler` 接口，wasm 只是它的一个宿主实现，
 所以「Core 不认识业务」这条规矩不用破；沙箱里的 IO 必须由宿主中介（capability 白名单），

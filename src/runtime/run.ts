@@ -55,10 +55,11 @@ export function isClaimableRunStatus(status: RunStatus): boolean {
 }
 
 /**
- * 这个 run 现在能不能被推进？
+ * 时间维度上到点了没有。
  *
- * - 等信号的 WAITING（wakeAt === null）**不能**抢 —— 抢了也没信号可消费，只会空转
- * - 等延迟的 WAITING 到点后才能抢
+ * - ACTIVE 状态：wakeAt 为空（普通推进）或已过期（RETRYING）
+ * - WAITING：必须有 wakeAt 且已过期 —— 等信号的 WAITING（wakeAt 为 null）光看时间是永远抢不到的，
+ *   它靠「有匹配的未消费信号」才可抢（那条规则在 storage 的 claimDue 里，两个适配器各自实现）
  */
 export function isRunDue(run: Pick<WorkflowRun, "status" | "wakeAt">, at: IsoTimestamp): boolean {
   if (run.status === "WAITING") return run.wakeAt !== null && run.wakeAt <= at;

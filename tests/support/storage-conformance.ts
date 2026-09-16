@@ -113,7 +113,9 @@ export function describeStorageConformance(title: string, harness: StorageHarnes
 
         const claimedByA = await storage.runs.claimDue({ owner: "A", limit: 10, leaseMs: 30_000, now: at() });
         expect(claimedByA.map((item) => item.id)).toEqual(["run-1", "run-2"]);
-        expect(claimedByA.every((item) => item.leaseOwner === "A" && item.status === "RUNNING")).toBe(true);
+        expect(claimedByA.every((item) => item.leaseOwner === "A")).toBe(true);
+        // claim 不碰 status —— 状态由 engine 负责，这里必须还是 CREATED
+        expect(claimedByA.every((item) => item.status === "CREATED")).toBe(true);
 
         expect(await storage.runs.claimDue({ owner: "B", limit: 10, leaseMs: 30_000, now: at() })).toEqual([]);
       });
@@ -140,10 +142,33 @@ export function describeStorageConformance(title: string, harness: StorageHarnes
         expect(claimed.map((item) => item.id)).toEqual(["delayed"]);
       });
 
-      it("等信号的 WAITING（wakeAt 为 null）永远不会被抢走 —— 否则就是空转", async () => {
+      it("等信号的 WAITING：没有信号抢不到；来了匹配的信号就能抢到", async () => {
         await storage.runs.create(makeRun("waiting", at(), { status: "WAITING", wakeAt: null }));
+        await storage.steps.create(
+          makeStepRun(at(), {
+            id: "sr-wait",
+            runId: "waiting",
+            stepId: "approve",
+            status: "WAITING",
+            waitFor: "approval",
+            output: undefined,
+            patch: undefined,
+          }),
+        );
+        await storage.runs.update("waiting", { currentStepId: "approve", currentStepRunId: "sr-wait" });
+
+        // 没信号 → 抢不到（抢了也没信号可消费，只会空转）
         clock.advance(3_600_000);
         expect(await storage.runs.claimDue({ owner: "A", limit: 10, leaseMs: 30_000, now: at() })).toEqual([]);
+
+        // 名字对不上 → 还是不抢
+        await storage.signals.append(makeSignal(at(), { id: "s-payment", runId: "waiting", name: "payment" }));
+        expect(await storage.runs.claimDue({ owner: "A", limit: 10, leaseMs: 30_000, now: at() })).toEqual([]);
+
+        // 名字对上了 → 可抢（这也是 signal 没有崩溃窗口的原因：run 不需要被叫醒，它自己变成可抢）
+        await storage.signals.append(makeSignal(at(), { id: "s-approval", runId: "waiting", name: "approval" }));
+        const claimed = await storage.runs.claimDue({ owner: "A", limit: 10, leaseMs: 30_000, now: at() });
+        expect(claimed.map((item) => item.id)).toEqual(["waiting"]);
       });
 
       it("续租只能续自己的；release 之后别人立刻能接手", async () => {

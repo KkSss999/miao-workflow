@@ -1,5 +1,6 @@
 import type { StepDefinition, StepId } from "../definition/step.js";
 import { isJsonValue, type JsonObject, type JsonValue } from "../json.js";
+import type { StepResume } from "../runtime/builtins.js";
 import type { IsoTimestamp, WorkflowRun } from "../runtime/run.js";
 import { buildIdempotencyKey, type StepRun, type StepStatus } from "../runtime/step-run.js";
 import type { WorkflowStorage } from "../storage/interface.js";
@@ -45,6 +46,22 @@ export interface StepExecutionContext {
 
   /** 超时 / 取消信号，传给 fetch 之类的 API */
   signal: AbortSignal;
+
+  /**
+   * 上一轮挂起的信息 —— **只有被叫醒重新执行时才有值**。
+   *
+   * handler 的写法因此永远是「同样的代码跑两次」：
+   *
+   * ```ts
+   * async execute(ctx) {
+   *   if (ctx.resume === undefined) return { status: "waiting", waitFor: "approval" };
+   *   return { status: "completed", output: ctx.resume.payload };
+   * }
+   * ```
+   *
+   * 这意味着 handler 必须是幂等的 —— 它可能因为崩溃恢复被多跑几次。
+   */
+  resume?: StepResume;
 }
 
 /**
@@ -87,6 +104,8 @@ export interface StepExecutionArgs {
   visit: number;
   /** 本次 step run 的 id：由 Engine 决定，崩溃恢复时复用同一个 id */
   stepRunId: string;
+  /** 被叫醒重新执行时带上挂起信息（首次执行/普通重试为 undefined） */
+  resume?: StepResume;
   /** 上一步的 output；start 步骤为 run.input */
   input: JsonValue | undefined;
   /**
@@ -115,7 +134,7 @@ export class StepRunner {
   constructor(readonly options: StepRunnerOptions) {}
 
   async execute(args: StepExecutionArgs): Promise<StepExecutionOutcome> {
-    const { run, stepId, step, visit, stepRunId, input, existing } = args;
+    const { run, stepId, step, visit, stepRunId, input, existing, resume } = args;
     const nowIso = (): IsoTimestamp => (this.options.now?.() ?? new Date()).toISOString();
 
     const attempt = (existing?.attempt ?? 0) + 1;
@@ -138,6 +157,7 @@ export class StepRunner {
         visit,
         idempotencyKey,
         signal: controller.signal,
+        ...(resume === undefined ? {} : { resume }),
       };
 
       const execution = handler.execute(context, step.config);
@@ -177,8 +197,10 @@ export class StepRunner {
     let output: JsonValue | undefined;
     let patch: JsonObject | undefined;
     let error: SerializedWorkflowError | null = null;
-    let waitFor: string | null = null;
-    let wakeAt: IsoTimestamp | null = null;
+    // 挂起信息要在失败/成功之后**保留**：被信号叫醒的那次尝试如果失败了，
+    // 重试时不能再要一次信号 —— 外部世界不会自己再来一遍。
+    let waitFor: string | null = existing?.waitFor ?? null;
+    let wakeAt: IsoTimestamp | null = existing?.wakeAt ?? null;
 
     if (result.status === "completed") {
       const invalid = firstNonJson({ output: result.output ?? null, patch: result.patch ?? null });

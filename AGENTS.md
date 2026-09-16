@@ -59,56 +59,65 @@ pnpm build      # tsc → dist/
 
 ## 当前进度（新增功能时同步更新）
 
-**Phase A + B 已完成**（101 个测试；Postgres 部分需要 Docker，没有就自动跳过）。已实现：
+**V1 的核心闭环已经跑通**（130 个测试；Postgres 部分需要 Docker，没有就自动跳过）。
+
+已实现：
 
 - `src/json.ts`、`src/definition/*`（归一化 / 校验 / hash / stableStringify）
-- `src/core/*`：errors / registry（publish 前 `assertRegistryCoverage`）/ transitions /
-  runner（handler 调用 · JSON 校验 · 超时 · 落 step run）/ engine（start · tick · 事件流）
-- `src/runtime/*`（状态机与记录类型、retry backoff 计算）
-- `src/storage/memory.ts` 与 `src/storage/postgres.ts`（五表 · JSONB 映射 · JSONB 白名单列更新）
-- `src/storage/schema.ts`（DDL 权威来源）
+- `src/core/*`：errors / registry（含 publish 前覆盖检查）/ transitions /
+  runner（handler · JSON 校验 · 超时 · 挂起契约）/ engine（start · tick · signal · cancel ·
+  reconcile · 事件流 · 内置 handler 注册）
+- `src/runtime/*`：状态机与记录 · retry backoff · **builtins（`workflow.delay` / `workflow.complete` ·
+  手搓 duration 解析）**
+- `src/storage/*`：interface · memory · postgres · schema（DDL 权威来源）
+- `src/worker/*`：worker（抢占 · 心跳 · drain · 失败隔离）· lease · scheduler
 
-**仍是桩，不要当已实现来用**：
-
-| 桩 | 抛什么 | Phase |
-|---|---|---|
-| `WorkflowWorker.tick` | `NotImplementedError` | C |
-| `WorkflowEngine.signal` / `cancel` | `NotImplementedError` | D |
-
-`Scheduler` / `LeaseManager` 已可用（调度循环与 lease 心跳是真的）。
+**没有桩了。** 下一步是 Phase F（WASM handler 宿主，独立扩展包）与 IntakeOps 真实接入验证。
 
 ## Phase A 定下来的语义（改之前先读懂，否则会破坏崩溃恢复）
 
 1. **「我做到哪」= `run.currentStepId` + `run.currentStepRunId` 指针。**
-   - 指针指向的 step run 是 COMPLETED → 恢复时**只重放 patch，不重放副作用**（patch 存在 step run 里）
+   - 指针指向的 step run 是 COMPLETED → 恢复时**只重放 patch，不重放副作用**
    - 指针为空 → 下一步是一次全新的访问；回边的 visit 自然 +1
    - 指针悬空（写下指针后、step run 落库前崩了）→ 复用**同一个 step run id 与同一幂等键**
-2. **执行前先写指针**（`currentStepRunId`），否则「已完成但没推进」这个窗口会变成重复副作用。
-3. **visit 完全由已落库的记录推导**：`(latest?.visit ?? 0) + 1`（同一 visit 内重试复用记录）。
+2. **执行前先写指针**，否则「已完成但没推进」这个窗口会变成重复副作用。
+3. **visit 完全由已落库的记录推导**：`(latest?.visit ?? 0) + 1`。
 4. **`input` = 上一个 COMPLETED 且 stepId 不同的 step run 的 output**；首步为 `run.input`。
-5. **run 级事件（`workflow.*`）的 `stepId` 必须是 null**，具体步骤放 payload；`step.*` 才带 stepId。
+   ⚠️ 推论：**`run.input` 只有首步看得到** —— 后面都要用的东西（比如 intakeId）由首步 patch 进 context。
+5. **run 级事件（`workflow.*`）的 `stepId` 必须是 null**；`step.*` 才带 stepId。
 6. **撞到 `maxStepsPerTick` 不是错误**：交回队列（release lease），下一轮从 `currentStepId` 继续。
-7. **UNKNOWN 永不自动重试**；可重试的失败才写 RETRYING + wake_at。
-8. **不要用「回到过去」的方式造崩溃现场**：把 run 指针往回拨到一个*后面已经有完成记录*的步骤是
-   不一致状态（回边语义会把它当成新的一次访问）。要测恢复，就拨到**最后执行的那一步**。
+7. **UNKNOWN 永不自动重试**；只有可重试的失败才写 RETRYING + wake_at。
 
-## Phase B 定下来的约定
+## Phase B/C/D 定下来的约定
 
-1. **run 必须绑定已发布的 definition**：`workflow_runs` 上有外键指向 `workflow_definitions`。
-   写测试/夹具时要先 publish，否则 Postgres 会报 FK 违例（memory 不报 —— 这是有意的差别，
-   conformance 里统一先 seed 一次 v1）。
-2. **顺序 = 插入顺序**：三张表都有 `seq bigint GENERATED ALWAYS AS IDENTITY`，
-   查询一律 `ORDER BY seq`（或 `created_at, seq`）。**绝不用随机 id 做 tiebreak**。
-3. **更新走白名单列**（`RUN_COLUMNS` / `STEP_RUN_COLUMNS`），绝不把调用方字符串拼进 SQL；
-   jsonb 列统一 `::jsonb` 转换（NULL 也要能写）。
-4. **`claimDue` 是单条 CTE 语句**（`FOR UPDATE SKIP LOCKED` + `UPDATE ... RETURNING`），
-   抢锁与写 lease 不可分开 —— 分成两条就会出现「两个 worker 都以为抢到了」。
-5. **`schema.ts` 是 DDL 权威来源**，`docs/postgres-schema.sql` 是副本；改完跑 `pnpm schema:sync`，
-   `tests/schema.test.ts` 会盯着这对文件是否漂移。
-6. **没有 `MWF_TEST_POSTGRES_URL` 就跳过**，不要假装测过；`pnpm test:postgres` 会拉临时容器。
+1. **status 只由 engine 写。** `claimDue` 只写 lease，**绝不改 status**。
+   踩过两次：claim 顺手把 `CREATED` 改成 `RUNNING` 会吞掉 `workflow.started` 事件；
+   把 `WAITING` 改成 `RUNNING` 会让 engine 再也看不到「这一步在等信号」。
+2. **「是不是在挂起」看当前 step run 的 `status === 'WAITING'` + `waitFor`**，不要看 `run.status`。
+3. **挂起信息（`waitFor` / `waitPayload` / `wakeAt`）在失败与成功之后都必须保留** ——
+   被信号叫醒的那次尝试失败后重试，不能再要一次信号。
+4. **signal 只写信号，不碰 run。** run 靠 `claimDue` 里的 EXISTS 条件变回可抢，
+   所以不存在「信号记下了但 run 没被叫醒」的崩溃窗口。别为了「快一点」在这里加 run 更新。
+5. **lease 的时钟必须和 engine 同源**（`WorkflowWorker` 默认 `engine.now`）。
+   多个 engine 共享同一 storage 时，注入的 `newId` 必须全局唯一（默认 randomUUID；顺序 id 会撞车）。
+6. **内存实现要守 Postgres 的约束**：外键（step run / signal / event 必须指向存在的 run）、
+   主键唯一、`idempotency_key` 唯一。两边不一致 = conformance 白写。
+7. **顺序 = 插入顺序**：三张表用自增 `seq`，查询 `ORDER BY seq`；**绝不用随机 id 做 tiebreak**。
+8. **没有 `MWF_TEST_POSTGRES_URL` 就跳过**，不要假装测过；`pnpm test:postgres` 拉临时容器。
 
-## 下一步（Phase C：可靠执行）
+## 命令
 
-`WorkflowWorker.tick`：`claim(concurrency)` → 给每个 run 挂 lease 心跳 → `engine.tick(runId, { owner })`
-→ release；以及 retry 端到端、crash recovery（真的 kill 掉一个 worker 再让另一个接手）、
-UNKNOWN 的人工 reconciliation 入口。之后 D（signal / delay / cancel）→ F（WASM handler 宿主）。
+```bash
+pnpm install
+pnpm check          # typecheck + 全部测试（memory conformance）
+pnpm test:postgres  # 临时容器跑同一套 conformance
+pnpm check:all      # 都要绿（提交前跑这个）
+pnpm build          # tsc → dist/
+pnpm schema:sync    # src/storage/schema.ts → docs/postgres-schema.sql
+```
+
+## 下一步（Phase F：WASM handler 宿主 + 真实接入）
+
+- Phase F：独立扩展包（`@catease/workflow-wasm`），Core 不动 —— handler 边界已经是 JSON in/out
+- IntakeOps 真实接入：`registry.register` 包住现有 service，触发层只调 `client.start`
+- 想加功能之前先回看 README 的「明确不做」清单

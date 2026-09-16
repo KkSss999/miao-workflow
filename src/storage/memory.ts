@@ -187,18 +187,23 @@ class MemoryRunStore implements RunStore {
     const at = options.now ?? this.storage.nowIso();
     const leaseExpiresAt = new Date(Date.parse(at) + options.leaseMs).toISOString();
 
+    const stepRuns = this.storage.stepRunsMap();
+    const signals = [...this.storage.signalsMap().values()];
+
     const due = [...this.storage.runsMap().values()]
       .filter(
         (run) =>
           isClaimableRunStatus(run.status) &&
-          isRunDue(run, at) &&
-          (run.leaseExpiresAt === null || run.leaseExpiresAt < at),
+          (run.leaseExpiresAt === null || run.leaseExpiresAt < at) &&
+          (isRunDue(run, at) || hasPendingSignalFor(run, stepRuns, signals)),
       )
       .sort(byCreatedAt)
       .slice(0, options.limit);
 
     for (const run of due) {
-      run.status = "RUNNING";
+      // 只写 lease，不改 status —— 状态语义由 engine 单独负责。
+      // 否则 claim 会把 CREATED / WAITING 抹掉，engine 就再也看不到「这个 run 还没开始」
+      // 或「这一步在等信号」，审计事件（workflow.started）也会被吞掉。
       run.leaseOwner = options.owner;
       run.leaseExpiresAt = leaseExpiresAt;
       run.updatedAt = at;
@@ -230,6 +235,7 @@ class MemoryStepRunStore implements StepRunStore {
   constructor(readonly storage: MemoryWorkflowStorage) {}
 
   async create(stepRun: StepRun): Promise<void> {
+    requireRunExists(this.storage, stepRun.runId, "step run");
     const stepRuns = this.storage.stepRunsMap();
     if (stepRuns.has(stepRun.id)) {
       throw new StorageConflictError(`step run "${stepRun.id}" 已存在`, { stepRunId: stepRun.id });
@@ -299,6 +305,7 @@ class MemorySignalStore implements SignalStore {
   constructor(readonly storage: MemoryWorkflowStorage) {}
 
   async append(signal: WorkflowSignal): Promise<void> {
+    requireRunExists(this.storage, signal.runId, "signal");
     const signals = this.storage.signalsMap();
     if (signals.has(signal.id)) {
       throw new StorageConflictError(`signal "${signal.id}" 已存在`, { signalId: signal.id });
@@ -332,6 +339,7 @@ class MemoryEventStore implements EventStore {
   constructor(readonly storage: MemoryWorkflowStorage) {}
 
   async append(event: WorkflowEvent): Promise<void> {
+    requireRunExists(this.storage, event.runId, "event");
     const events = this.storage.eventsMap();
     if (events.has(event.id)) {
       throw new StorageConflictError(`event "${event.id}" 已存在`, { eventId: event.id });
@@ -346,6 +354,31 @@ class MemoryEventStore implements EventStore {
     const sliced = all.slice(startIndex);
     return clone(options.limit === undefined ? sliced : sliced.slice(0, options.limit));
   }
+}
+
+/** Postgres 上有外键（step_runs / signals / events → runs），内存实现必须守同一条规矩。 */
+function requireRunExists(storage: MemoryWorkflowStorage, runId: string, what: string): void {
+  if (!storage.runsMap().has(runId)) {
+    throw new StorageConflictError(`${what} 引用的 run "${runId}" 不存在（外键约束）`, { runId });
+  }
+}
+
+/**
+ * 等信号的 WAITING：`wake_at` 是空的，光看时间永远抢不到。
+ * 判断依据是「当前挂起的步骤在等什么」+「有没有对应的未消费信号」。
+ *
+ * 与 CLAIM_DUE_SQL 里的 EXISTS 子查询是同一个规则（conformance 测试盯着两边别跑偏）。
+ */
+function hasPendingSignalFor(
+  run: WorkflowRun,
+  stepRuns: Map<string, StepRun>,
+  signals: readonly WorkflowSignal[],
+): boolean {
+  if (run.status !== "WAITING" || run.currentStepRunId === null) return false;
+  const active = stepRuns.get(run.currentStepRunId);
+  const waitFor = active?.waitFor ?? null;
+  if (waitFor === null) return false;
+  return signals.some((signal) => signal.runId === run.id && signal.name === waitFor && signal.consumedAt === null);
 }
 
 /**

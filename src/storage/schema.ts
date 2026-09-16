@@ -143,25 +143,44 @@ CREATE INDEX IF NOT EXISTS workflow_events_run_idx
 /**
  * Worker 每次 tick 都跑这条（`FOR UPDATE SKIP LOCKED`，一条语句里完成抢锁 + 写 lease）。
  *
- * 关键细节：`status = 'WAITING'` 的 run 只有在 `wake_at` 到点后才会被抢 ——
- * 等信号的 WAITING（wake_at IS NULL）抢了也没信号可消费，只会空转。
+ * 三个关键细节：
+ * 1. **只写 lease，不改 status** —— 状态语义由 engine 单独负责，否则 claim 会把
+ *    CREATED / WAITING 抹掉，engine 就看不到「还没开始」或「在等信号」。
+ * 2. 等信号的 WAITING（wake_at IS NULL）只有**存在匹配的未消费信号**时才可抢 ——
+ *    否则抢了也没信号可消费，只会空转。
+ * 2. 这个 EXISTS 分支同时解决了 signal 的崩溃窗口：`engine.signal()` 只写信号、不碰 run，
+ *    于是不存在「信号记下了但 run 没被叫醒」的半完成状态。
  */
 export const CLAIM_DUE_SQL = `WITH due AS (
     SELECT id
       FROM workflow_runs
      WHERE status = ANY($1::text[])
-       AND (status <> 'WAITING' OR wake_at IS NOT NULL)
-       AND (wake_at IS NULL OR wake_at <= $2::timestamptz)
        AND (lease_expires_at IS NULL OR lease_expires_at < $2::timestamptz)
+       AND (
+             -- 常规：到点就能跑（RETRYING 靠 wake_at；ACTIVE 通常为 NULL）
+             (status <> 'WAITING' AND (wake_at IS NULL OR wake_at <= $2::timestamptz))
+             -- 挂起中：时间到点（delay / 等待超时），或者有匹配的未消费信号（人类点了 Approve）
+          OR (status = 'WAITING' AND (
+                   (wake_at IS NOT NULL AND wake_at <= $2::timestamptz)
+                OR EXISTS (
+                     SELECT 1
+                       FROM workflow_signals s
+                       JOIN workflow_step_runs sr ON sr.id = workflow_runs.current_step_run_id
+                      WHERE s.run_id = workflow_runs.id
+                        AND sr.wait_for IS NOT NULL
+                        AND s.name = sr.wait_for
+                        AND s.consumed_at IS NULL
+                   )
+             ))
+       )
      ORDER BY created_at, seq
      FOR UPDATE SKIP LOCKED
      LIMIT $3
 )
 UPDATE workflow_runs r
-   SET status          = 'RUNNING',
-       lease_owner     = $4,
+   SET lease_owner      = $4,
        lease_expires_at = $5::timestamptz,
-       updated_at      = $2::timestamptz
+       updated_at       = $2::timestamptz
   FROM due
  WHERE r.id = due.id
 RETURNING r.*`;

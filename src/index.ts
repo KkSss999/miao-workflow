@@ -59,7 +59,14 @@ export {
   WorkflowClient,
   WorkflowEngine,
 } from "./core/engine.js";
-export type { EngineLimits, StartRunOptions, TickOptions, TickResult, WorkflowEngineOptions } from "./core/engine.js";
+export type {
+  EngineLimits,
+  ReconcileDecision,
+  StartRunOptions,
+  TickOptions,
+  TickResult,
+  WorkflowEngineOptions,
+} from "./core/engine.js";
 
 export {
   RESERVED_HANDLERS,
@@ -146,6 +153,14 @@ export type { StepRun, StepRunPatch, StepStatus } from "./runtime/step-run.js";
 
 export type { SignalInput, WorkflowSignal } from "./runtime/signal.js";
 export type { WorkflowEvent, WorkflowEventType } from "./runtime/events.js";
+
+export {
+  RESERVED_HANDLERS as BUILTIN_HANDLERS,
+  createCompleteHandler,
+  createDelayHandler,
+  parseDuration,
+} from "./runtime/builtins.js";
+export type { DelayConfig, StepResume } from "./runtime/builtins.js";
 
 export {
   DEFAULT_RETRY_POLICY,

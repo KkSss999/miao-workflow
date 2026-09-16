@@ -156,7 +156,12 @@ class MemoryRunStore implements RunStore {
   constructor(readonly storage: MemoryWorkflowStorage) {}
 
   async create(run: WorkflowRun): Promise<void> {
-    this.storage.runsMap().set(run.id, clone(run));
+    const runs = this.storage.runsMap();
+    // 与 Postgres 的主键约束对齐：重复 id 必须报错，而不是悄悄覆盖
+    if (runs.has(run.id)) {
+      throw new StorageConflictError(`run "${run.id}" 已存在`, { runId: run.id });
+    }
+    runs.set(run.id, clone(run));
   }
 
   async get(runId: string): Promise<WorkflowRun | null> {
@@ -225,7 +230,19 @@ class MemoryStepRunStore implements StepRunStore {
   constructor(readonly storage: MemoryWorkflowStorage) {}
 
   async create(stepRun: StepRun): Promise<void> {
-    this.storage.stepRunsMap().set(stepRun.id, clone(stepRun));
+    const stepRuns = this.storage.stepRunsMap();
+    if (stepRuns.has(stepRun.id)) {
+      throw new StorageConflictError(`step run "${stepRun.id}" 已存在`, { stepRunId: stepRun.id });
+    }
+    // 与 Postgres 的 UNIQUE(idempotency_key) 对齐：这是「重复副作用」的最后一道闸
+    for (const existing of stepRuns.values()) {
+      if (existing.idempotencyKey === stepRun.idempotencyKey) {
+        throw new StorageConflictError(`幂等键 "${stepRun.idempotencyKey}" 已存在`, {
+          idempotencyKey: stepRun.idempotencyKey,
+        });
+      }
+    }
+    stepRuns.set(stepRun.id, clone(stepRun));
   }
 
   async get(stepRunId: string): Promise<StepRun | null> {
@@ -282,7 +299,11 @@ class MemorySignalStore implements SignalStore {
   constructor(readonly storage: MemoryWorkflowStorage) {}
 
   async append(signal: WorkflowSignal): Promise<void> {
-    this.storage.signalsMap().set(signal.id, clone(signal));
+    const signals = this.storage.signalsMap();
+    if (signals.has(signal.id)) {
+      throw new StorageConflictError(`signal "${signal.id}" 已存在`, { signalId: signal.id });
+    }
+    signals.set(signal.id, clone(signal));
   }
 
   async consumeNext(runId: string, name: string, now?: string): Promise<WorkflowSignal | null> {
@@ -311,7 +332,11 @@ class MemoryEventStore implements EventStore {
   constructor(readonly storage: MemoryWorkflowStorage) {}
 
   async append(event: WorkflowEvent): Promise<void> {
-    this.storage.eventsMap().set(event.id, clone(event));
+    const events = this.storage.eventsMap();
+    if (events.has(event.id)) {
+      throw new StorageConflictError(`event "${event.id}" 已存在`, { eventId: event.id });
+    }
+    events.set(event.id, clone(event));
   }
 
   async listByRun(runId: string, options: { limit?: number; after?: string } = {}): Promise<WorkflowEvent[]> {

@@ -1,4 +1,14 @@
--- miao-workflow (@catease/workflow) —— PostgreSQL schema
+/**
+ * PostgreSQL schema —— 五张表。
+ *
+ * 这里是**唯一权威来源**：`docs/postgres-schema.sql` 是给人看的副本，
+ * `tests/schema.test.ts` 会断言两者一致（改一边不改另一边就会红）。
+ *
+ * 为什么放进 TS 而不是运行时读 .sql 文件：
+ * 包对外只发布 `dist/`，读文件在消费方那边随时会失效；内联字符串永远可用。
+ */
+
+export const SCHEMA_SQL = `-- miao-workflow (@catease/workflow) —— PostgreSQL schema
 --
 -- 五张表。没有 Redis，没有独立 scheduler，没有消息队列。
 -- 并发抢占靠 workflow_runs 上的 FOR UPDATE SKIP LOCKED。
@@ -128,3 +138,45 @@ CREATE TABLE IF NOT EXISTS workflow_events (
 
 CREATE INDEX IF NOT EXISTS workflow_events_run_idx
     ON workflow_events (run_id, seq);
+`;
+
+/**
+ * Worker 每次 tick 都跑这条（`FOR UPDATE SKIP LOCKED`，一条语句里完成抢锁 + 写 lease）。
+ *
+ * 关键细节：`status = 'WAITING'` 的 run 只有在 `wake_at` 到点后才会被抢 ——
+ * 等信号的 WAITING（wake_at IS NULL）抢了也没信号可消费，只会空转。
+ */
+export const CLAIM_DUE_SQL = `WITH due AS (
+    SELECT id
+      FROM workflow_runs
+     WHERE status = ANY($1::text[])
+       AND (status <> 'WAITING' OR wake_at IS NOT NULL)
+       AND (wake_at IS NULL OR wake_at <= $2::timestamptz)
+       AND (lease_expires_at IS NULL OR lease_expires_at < $2::timestamptz)
+     ORDER BY created_at, seq
+     FOR UPDATE SKIP LOCKED
+     LIMIT $3
+)
+UPDATE workflow_runs r
+   SET status          = 'RUNNING',
+       lease_owner     = $4,
+       lease_expires_at = $5::timestamptz,
+       updated_at      = $2::timestamptz
+  FROM due
+ WHERE r.id = due.id
+RETURNING r.*`;
+
+/** 消费一条信号：原子地挑出最老的一条未消费信号并打上 consumed_at。 */
+export const CONSUME_SIGNAL_SQL = `UPDATE workflow_signals
+    SET consumed_at = $3::timestamptz
+  WHERE id = (
+        SELECT id
+          FROM workflow_signals
+         WHERE run_id = $1
+           AND name = $2
+           AND consumed_at IS NULL
+         ORDER BY created_at, seq
+         LIMIT 1
+         FOR UPDATE SKIP LOCKED
+  )
+RETURNING *`;

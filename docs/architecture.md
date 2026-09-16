@@ -247,12 +247,26 @@ RBAC · 多租户 · Connector 市场 · Redis 依赖 · Kubernetes · 分布式
 | Phase | 内容 | 目标 | 状态 |
 |---|---|---|---|
 | **A** | Definition · Registry · Handler · Transition · Engine · 事件流 | `A → B → C` + 条件分支 + 崩溃不重放副作用 | ✅ 完成 |
-| **B** | PostgresStorage · Run/StepRun/Events · 版本化 | `kill -9` → 重启 → 继续 | 与 A 并行 |
+| **B** | PostgresStorage · Run/StepRun/Events · 版本化 | `kill -9` → 重启 → 继续 | ✅ 完成 |
 | **C** | Retry 端到端 · Lease 接入 · Crash Recovery · UNKNOWN | 崩溃与重复都不出错 | — |
 | **D** | Signal · Wait · Resume · Delay · Cancel | **Core V1 完成** | — |
 | **F** | WASM handler 宿主（独立扩展包） | 第三方打包一个 wasm 就接进来 | 设计已定 |
 
 E（包住 IntakeOps）不再作为阶段 —— D 完成之后顺手验证即可。
+
+## 两个适配器，一套断言
+
+Memory 和 Postgres 跑的是**同一份 conformance 套件**（`tests/support/storage-conformance.ts`）：
+definition 版本不可变、lease 独占与过期、`wake_at` 门控、signal 只消费一次、
+幂等键唯一、事件顺序、以及「重启一个全新 engine 从指针继续」的端到端恢复。
+
+这不是为了凑覆盖率，而是为了让一句话成立：**用内存跑测试、用 Postgres 上生产，行为一致。**
+
+Postgres 侧另外两条只属于它自己的保证：
+
+- `claimDue` 是**一条**语句：`WITH due AS (SELECT ... FOR UPDATE SKIP LOCKED) UPDATE ... RETURNING`。
+  抢锁和写 lease 一旦分成两条事务，就会出现「两个 worker 都以为抢到了」。
+- 顺序用自增 `seq`，不用随机 id 做 tiebreak（`ORDER BY created_at` 会并列，`id` 会乱序）。
 
 ## 崩溃恢复：指针 + 重放（Phase A 定死）
 

@@ -59,19 +59,19 @@ pnpm build      # tsc → dist/
 
 ## 当前进度（新增功能时同步更新）
 
-**Phase A 已完成**（73 个测试全绿）。已实现：
+**Phase A + B 已完成**（101 个测试；Postgres 部分需要 Docker，没有就自动跳过）。已实现：
 
 - `src/json.ts`、`src/definition/*`（归一化 / 校验 / hash / stableStringify）
-- `src/core/*`：errors / registry（含 publish 前的 `assertRegistryCoverage`）/ transitions /
-  **runner（handler 调用 · 结果 JSON 校验 · 超时 · 落 step run）** / **engine（start · tick · 事件流）**
+- `src/core/*`：errors / registry（publish 前 `assertRegistryCoverage`）/ transitions /
+  runner（handler 调用 · JSON 校验 · 超时 · 落 step run）/ engine（start · tick · 事件流）
 - `src/runtime/*`（状态机与记录类型、retry backoff 计算）
-- `src/storage/memory.ts`（五类 Store 全部实现，语义与 Postgres 对齐）
+- `src/storage/memory.ts` 与 `src/storage/postgres.ts`（五表 · JSONB 映射 · JSONB 白名单列更新）
+- `src/storage/schema.ts`（DDL 权威来源）
 
 **仍是桩，不要当已实现来用**：
 
 | 桩 | 抛什么 | Phase |
 |---|---|---|
-| `PostgresWorkflowStorage.*` | `NotImplementedError` | B |
 | `WorkflowWorker.tick` | `NotImplementedError` | C |
 | `WorkflowEngine.signal` / `cancel` | `NotImplementedError` | D |
 
@@ -89,15 +89,26 @@ pnpm build      # tsc → dist/
 5. **run 级事件（`workflow.*`）的 `stepId` 必须是 null**，具体步骤放 payload；`step.*` 才带 stepId。
 6. **撞到 `maxStepsPerTick` 不是错误**：交回队列（release lease），下一轮从 `currentStepId` 继续。
 7. **UNKNOWN 永不自动重试**；可重试的失败才写 RETRYING + wake_at。
-8. **内存 storage 的自然顺序 = Map 插入顺序**，`createdAt` 并列时不要用 id 做 tiebreak
-   （字符串序下 `"id-10" < "id-2"`）。
+8. **不要用「回到过去」的方式造崩溃现场**：把 run 指针往回拨到一个*后面已经有完成记录*的步骤是
+   不一致状态（回边语义会把它当成新的一次访问）。要测恢复，就拨到**最后执行的那一步**。
 
-## 下一步（Phase B：Postgres，与 A 并行推进）
+## Phase B 定下来的约定
 
-五张表见 `docs/postgres-schema.sql`（`current_step_run_id` 与 `patch` 两列已经对上 A 的语义）。
-实现五个 Store 的 SQL + JSONB 行↔记录映射；`claimDue` 必须用 `FOR UPDATE SKIP LOCKED` 并在**同一条
-语句/事务**里写上 lease；测试用 `scripts/test-postgres.sh`（临时容器 + `MWF_TEST_POSTGRES_URL`），
-没有环境时 `describe.skipIf` 跳过，不要假装测过。
+1. **run 必须绑定已发布的 definition**：`workflow_runs` 上有外键指向 `workflow_definitions`。
+   写测试/夹具时要先 publish，否则 Postgres 会报 FK 违例（memory 不报 —— 这是有意的差别，
+   conformance 里统一先 seed 一次 v1）。
+2. **顺序 = 插入顺序**：三张表都有 `seq bigint GENERATED ALWAYS AS IDENTITY`，
+   查询一律 `ORDER BY seq`（或 `created_at, seq`）。**绝不用随机 id 做 tiebreak**。
+3. **更新走白名单列**（`RUN_COLUMNS` / `STEP_RUN_COLUMNS`），绝不把调用方字符串拼进 SQL；
+   jsonb 列统一 `::jsonb` 转换（NULL 也要能写）。
+4. **`claimDue` 是单条 CTE 语句**（`FOR UPDATE SKIP LOCKED` + `UPDATE ... RETURNING`），
+   抢锁与写 lease 不可分开 —— 分成两条就会出现「两个 worker 都以为抢到了」。
+5. **`schema.ts` 是 DDL 权威来源**，`docs/postgres-schema.sql` 是副本；改完跑 `pnpm schema:sync`，
+   `tests/schema.test.ts` 会盯着这对文件是否漂移。
+6. **没有 `MWF_TEST_POSTGRES_URL` 就跳过**，不要假装测过；`pnpm test:postgres` 会拉临时容器。
 
-之后：C（retry 端到端 / lease 接入 / crash recovery / UNKNOWN）→ D（signal / delay / cancel）→
-F（WASM handler 宿主，独立扩展包）。E 不再作为阶段：IntakeOps 集成在 D 之后顺手验证。
+## 下一步（Phase C：可靠执行）
+
+`WorkflowWorker.tick`：`claim(concurrency)` → 给每个 run 挂 lease 心跳 → `engine.tick(runId, { owner })`
+→ release；以及 retry 端到端、crash recovery（真的 kill 掉一个 worker 再让另一个接手）、
+UNKNOWN 的人工 reconciliation 入口。之后 D（signal / delay / cancel）→ F（WASM handler 宿主）。

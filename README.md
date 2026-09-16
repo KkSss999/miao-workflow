@@ -68,9 +68,14 @@ Core 只知道 `Workflow · Run · Step · Transition · Handler · Signal · Re
 
 ## 状态
 
-Phase A 已完成：`engine.start` / `engine.tick` / `StepRunner.execute` 是真的，**顺序执行、条件分支、
-崩溃恢复（不重放副作用）、版本绑定、防死循环都跑通了**（73 个测试）。
-Postgres 适配器、Worker 抢占循环、signal/delay 仍是桩，按 Phase 填充。
+**Phase A 已完成**：`engine.start` / `engine.tick` / `StepRunner.execute` 是真的 ——
+顺序执行、条件分支、崩溃恢复（不重放副作用）、版本绑定、防死循环都跑通了。
+
+**Phase B 已完成**：`PostgresWorkflowStorage` 五个 Store 全部实现，`migrate()` 幂等建表，
+`claimDue` 用一条 `FOR UPDATE SKIP LOCKED` 的 `UPDATE ... RETURNING` 完成抢锁 + 写 lease。
+Memory 与 Postgres 跑**同一套 conformance 断言**（101 个测试），所以「内存测、Postgres 上生产」不是空话。
+
+Worker 抢占循环、signal/delay 仍是桩，按 Phase 填充。
 
 | 模块 | 状态 | Phase |
 |---|---|---|
@@ -88,7 +93,8 @@ Postgres 适配器、Worker 抢占循环、signal/delay 仍是桩，按 Phase �
 | 版本绑定（老 run 永远跑它绑定的版本） | ✅ 实现 | A |
 | `maxStepsPerTick` 防死循环 | ✅ 实现 | A |
 | Retry 决策（可重试 → RETRYING + wake_at） | ✅ 实现（策略层测试在 C） | A |
-| `PostgresWorkflowStorage` | 🚧 桩 | B |
+| `PostgresWorkflowStorage`（五表 · JSONB 映射 · `SKIP LOCKED` 抢占） | ✅ 实现 | A/B |
+| Storage conformance：Memory 与 Postgres 同一套断言 | ✅ 实现 | B |
 | `WorkflowWorker.tick` | 🚧 桩 | C |
 | signal / cancel / delay | 🚧 桩 | D |
 | WASM handler 宿主（第三方扩展） | 💡 设计已定 | F |
@@ -96,9 +102,14 @@ Postgres 适配器、Worker 抢占循环、signal/delay 仍是桩，按 Phase �
 
 ```bash
 pnpm install
-pnpm check     # typecheck + 73 个测试
-pnpm build     # tsc → dist/（ESM + .d.ts）
+pnpm check          # typecheck + 全部测试（含 memory conformance）
+pnpm test:postgres  # 拉一个临时 Postgres 容器，跑同一套 conformance（用完即删）
+pnpm check:all      # 上面两个都跑
+pnpm build          # tsc → dist/（ESM + .d.ts）
+pnpm schema:sync    # 把 schema.ts 同步到 docs/postgres-schema.sql
 ```
+
+没有 Docker 也没关系：postgres 那部分会 `describe.skipIf` 跳过（**不会假装测过**）。
 
 ## 目录
 
@@ -124,16 +135,18 @@ src/
   storage/
     interface.ts       五个 Store 的接口
     memory.ts          内存实现（tests / dev / demo）
-    postgres.ts        PostgreSQL 适配器（Phase B）
+    postgres.ts        PostgreSQL 适配器（五表 · JSONB · SKIP LOCKED）
+    schema.ts          DDL（权威来源；docs/*.sql 是它的副本）
   worker/
     worker.ts          WorkflowWorker
     lease.ts           LeaseManager（lease + 心跳）
     scheduler.ts       轮询调度（不用分布式 scheduler）
 tests/
+  support/             共用的 storage 夹具 + conformance 套件
 examples/intakeops/    第一个 dogfood 目标
 docs/
   architecture.md      设计取舍、执行语义、状态机、与三家的关系
-  postgres-schema.sql  五张表
+  postgres-schema.sql  五张表（由 src/storage/schema.ts 生成，别手改）
 ```
 
 ## 三条不能破的规矩
@@ -154,7 +167,7 @@ Connector 市场 · Redis 依赖 · Kubernetes · 分布式 scheduler · AI Agen
 | Phase | 内容 | 完成标志 |
 |---|---|---|
 | **A** | Engine + StepRunner + 事件流 | ✅ **已完成**：`A → B → C`、条件分支、崩溃恢复、防死循环 |
-| **B** | PostgresStorage + 版本化 + events | `kill -9` → 重启 → 继续（与 A 并行推进） |
+| **B** | PostgresStorage + 版本化 + events | ✅ **已完成**：与 memory 同一套 conformance 全绿（真容器） |
 | **C** | Retry 端到端 / Lease 接入 / Crash Recovery / UNKNOWN 语义 | 崩溃与重复都不出错 |
 | **D** | Signal / Wait / Resume / Delay / Cancel | **Core V1 完成** |
 | **F** | WASM handler 宿主（独立扩展包） | 第三方打包一个 wasm 就能接进来 |

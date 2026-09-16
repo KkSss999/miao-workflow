@@ -46,10 +46,15 @@
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run",
     "test:watch": "vitest",
-    "check": "pnpm run typecheck && pnpm run test"
+    "test:postgres": "bash scripts/test-postgres.sh",
+    "check": "pnpm run typecheck && pnpm run test",
+    "check:all": "pnpm run typecheck && pnpm run test && pnpm run test:postgres",
+    "schema:sync": "node scripts/sync-schema.mjs"
   },
   "devDependencies": {
     "@types/node": "^24.13.5",
+    "@types/pg": "^8.23.1",
+    "pg": "^8.23.0",
     "typescript": "^5.9.3",
     "vitest": "^5.0.1"
   }

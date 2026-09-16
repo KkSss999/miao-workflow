@@ -161,6 +161,7 @@ export { MemoryWorkflowStorage } from "./storage/memory.js";
 export type { MemoryStorageOptions } from "./storage/memory.js";
 export { PostgresWorkflowStorage } from "./storage/postgres.js";
 export type { PostgresStorageOptions, SqlClient, SqlQueryResult } from "./storage/postgres.js";
+export { CLAIM_DUE_SQL, CONSUME_SIGNAL_SQL, SCHEMA_SQL } from "./storage/schema.js";
 export type {
   ClaimOptions,
   DefinitionRecord,

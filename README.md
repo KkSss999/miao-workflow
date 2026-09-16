@@ -4,6 +4,8 @@
 
 工作流编排项目。目前只有目录骨架，实现尚未开始。
 
+公开仓库：https://github.com/KkSss999/miaoworkflow
+
 ## 状态
 
 | 项 | 状态 |

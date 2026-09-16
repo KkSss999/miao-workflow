@@ -9,6 +9,7 @@ import {
   type WasmStepResponse,
 } from "./abi.js";
 import { WasmHostError } from "./errors.js";
+import type { WasmStepInvoker } from "./invoker.js";
 import {
   toModuleBytes,
   wasmRuntime,
@@ -50,7 +51,7 @@ interface RequiredExports {
  * 注意 `invoke` 是同步的：模块里的死循环会阻塞事件循环，
  * `StepRunner` 的 Promise.race 超时救不了它。`maxDurationMs` 只做事后审计。
  */
-export class WasmStepModule {
+export class WasmStepModule implements WasmStepInvoker {
   readonly module: WasmModuleLike;
   readonly name: string;
   readonly maxResponseBytes: number;
@@ -132,8 +133,21 @@ export class WasmStepModule {
     return this.#memory;
   }
 
-  /** 执行一次。同步、纯计算；任何异常都会被包成 WasmHostError。 */
-  invoke(request: WasmStepRequest): WasmStepResponse {
+  /**
+   * 执行一次。同步、纯计算；任何异常都会被包成 WasmHostError。
+   *
+   * `signal` 只会在**开始前**被检查（已经中止就不启动），执行过程中拦不住 ——
+   * 同步 wasm 无法被中断。要能掐断就用 worker 执行模式（WasmWorkerHost）。
+   */
+  invoke(request: WasmStepRequest, signal?: AbortSignal): WasmStepResponse {
+    if (signal?.aborted === true) {
+      throw new WasmHostError(`wasm 模块 "${this.name}" 在调用前已被中止`, {
+        kind: "wasm.overrun",
+        moduleName: this.name,
+        code: "STEP_TIMEOUT",
+      });
+    }
+
     const startedAt = Date.now();
 
     // 给模块一个复位的机会（bump allocator 不会自己回收）
@@ -171,6 +185,11 @@ export class WasmStepModule {
   /** 直接用 JSON 调用（测试与工具用）。 */
   invokeJson(request: JsonObject): WasmStepResponse {
     return this.invoke(request as unknown as WasmStepRequest);
+  }
+
+  /** 同线程模式没有需要释放的东西（内存随实例回收）。 */
+  dispose(): void {
+    // no-op
   }
 
   #alloc(size: number): number {

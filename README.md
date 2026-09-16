@@ -91,7 +91,7 @@ Core 只知道 `Workflow · Run · Step · Transition · Handler · Signal · Re
 | B | PostgresStorage | ✅ 五表 · JSONB 映射 · `SKIP LOCKED` 抢占；与 memory 跑同一套 conformance |
 | C | 可靠执行 | ✅ Worker 抢占循环 · lease 心跳 · 真·crash recovery · 失败隔离 · UNKNOWN 的 reconcile |
 | D | 异步与信号 | ✅ signal/wait/resume · `workflow.delay` · cancel · 等待超时 |
-| F | WASM handler 宿主 | ✅ 手搓 ABI v1 · 零依赖 · 第三方打包一个模块就接进来 |
+| F | WASM handler 宿主 | ✅ 手搓 ABI v1 · 两种执行模式（inline / worker 线程隔离）· 零依赖 |
 
 人审批可以等三天、delay 可以等两周 —— **等待期间不占进程、不挂 Promise，进程随便 kill -9**。
 
@@ -161,6 +161,9 @@ src/
     instance.ts        模块加载 · 校验 · 内存读写 · 护栏
     handler.ts         → StepHandler · registerWasmHandlers
     runtime.ts         结构性 wasm 运行时接口（不污染消费者的 lib 配置）
+    invoker.ts         「谁执行」的抽象：同线程 / worker 线程
+    worker-host.ts     worker 执行模式（懒启动 · 超时 terminate · 自动恢复）
+    worker-entry.js    线程入口（纯 JS，理由见文件头）
   worker/
     worker.ts          WorkflowWorker
     lease.ts           LeaseManager（lease + 心跳）
@@ -205,9 +208,21 @@ registerWasmHandlers(registry, {
    只做纯计算（提取 / 校验 / 规则判定 / 模板渲染 / 格式转换）。要 IO 就显式白名单化地传 capability。
 3. **边界是 JSON in / JSON out** —— 将来换执行模式（worker_threads / 远程宿主）不用改协议。
 
-**诚实说明**：`mwf_execute` 是同步调用，模块里的死循环会阻塞事件循环，
-`StepRunner` 的超时**救不了它**。所以 v1 的定位是「有界的纯计算」；
-真要跑不可信代码，走 F.1：worker_threads 执行模式（超时 = terminate worker）。
+**两种执行模式**（同步 wasm 无法被中断，所以「谁来兜住它」必须选清楚）：
+
+| | `"inline"`（默认） | `"worker"` |
+|---|---|---|
+| 线程 | 同线程，最快 | 独立 worker_threads |
+| 死循环 | 会焊死事件循环，超时拦不住 | **`terminate()` 掉**，`step.timeoutMs` 真生效 |
+| 适合 | 自己写的可信模块 | **第三方模块** |
+
+```ts
+// 第三方模块放 worker 线程跑；超时（含 step.timeoutMs）= terminate
+registerWasmHandlers(registry, { "text.extract": bytes }, { execution: "worker", timeoutMs: 1_000 });
+```
+
+worker 模式懒启动、被掐掉后自动重起、空闲时 `unref`（不会吊住进程）。
+线程里没有 `fs` / `net` / 时钟 —— 隔离 ≠ 提权。
 
 ABI 规范（含模块要求、请求/响应格式、护栏）：[docs/wasm-abi.md](docs/wasm-abi.md)
 
@@ -225,7 +240,6 @@ Connector 市场 · Redis 依赖 · Kubernetes · 分布式 scheduler · AI Agen
 | **C** | Retry 端到端 / Lease / Crash Recovery / UNKNOWN 语义 | ✅ **已完成** |
 | **D** | Signal / Wait / Resume / Delay / Cancel | ✅ **已完成** —— Core V1 闭环 |
 | **F** | WASM handler 宿主（`@catease/workflow/wasm`） | ✅ **已完成**（ABI v1，零依赖，手搓测试夹具） |
-| **F.1** | worker_threads 执行模式（跑不可信模块） | 超时 = terminate worker |
 
 E（包住 IntakeOps）不再单独成阶段 —— 它已经是 `tests/examples.test.ts` 里的端到端用例
 （分类 → 人工复核 → 审批 → 建 lead → 发邮件，全程靠信号推进）。

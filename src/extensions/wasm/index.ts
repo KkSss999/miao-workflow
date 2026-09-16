@@ -12,9 +12,12 @@
  * import { registerWasmHandlers } from "@catease/workflow/wasm";
  *
  * const registry = new Registry();
- * registerWasmHandlers(registry, {
- *   "text.extract": await readFile("./extract.wasm"),
- * });
+ * registerWasmHandlers(
+ *   registry,
+ *   { "text.extract": await readFile("./extract.wasm") },
+ *   // 第三方模块放 worker 线程跑：超时 = terminate，死循环也拦得住
+ *   { execution: "worker", timeoutMs: 1_000 },
+ * );
  * ```
  *
  * ABI 规范：docs/wasm-abi.md
@@ -36,6 +39,10 @@ export type { WasmHostErrorKind, WasmHostErrorOptions } from "./errors.js";
 export { WasmStepModule, loadWasmModule } from "./instance.js";
 export type { WasmModuleOptions } from "./instance.js";
 
+export { WasmWorkerHost } from "./worker-host.js";
+export type { WasmWorkerHostOptions } from "./worker-host.js";
+export type { WasmStepInvoker } from "./invoker.js";
+
 export { WasmRuntimeUnavailableError, wasmRuntime } from "./runtime.js";
 export type {
   WasmImportsLike,
@@ -47,4 +54,4 @@ export type {
 } from "./runtime.js";
 
 export { createWasmHandler, handlerFor, registerWasmHandlers } from "./handler.js";
-export type { WasmHandlerOptions } from "./handler.js";
+export type { WasmHandlerOptions, WasmStepHandler } from "./handler.js";

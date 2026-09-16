@@ -45,7 +45,7 @@
     "README.md"
   ],
   "scripts": {
-    "build": "pnpm run clean && tsc -p tsconfig.build.json",
+    "build": "pnpm run clean && tsc -p tsconfig.build.json && node scripts/copy-wasm-worker.mjs",
     "clean": "rm -rf dist",
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run",

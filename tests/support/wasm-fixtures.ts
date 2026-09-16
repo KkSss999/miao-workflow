@@ -113,6 +113,14 @@ export const op = {
   call(funcIndex: number): number[] {
     return [0x10, ...uleb(funcIndex)];
   },
+  /** loop（空 blocktype） */
+  loop(): number[] {
+    return [0x03, 0x40];
+  },
+  /** br 到第 n 层 */
+  br(depth: number): number[] {
+    return [0x0c, ...uleb(depth)];
+  },
   drop(): number[] {
     return [0x1a];
   },
@@ -402,6 +410,33 @@ export function buildHugeLengthModule(): Uint8Array {
           op.i32Const(-16),
           op.i32Store(),
           op.localGet(2),
+        ),
+      },
+    },
+  });
+}
+
+/**
+ * 永远不返回的模块 —— 死循环。
+ *
+ * 这是 worker 执行模式存在的理由：同线程模式下它会把事件循环焊死，
+ * 独立线程里 `terminate()` 就能收拾它。
+ */
+export function buildInfiniteLoopModule(): Uint8Array {
+  return buildModule({
+    pages: 1,
+    globals: [HEAP_BASE],
+    functions: {
+      mwf_abi_version: { body: op.i32Const(1) },
+      mwf_alloc: { params: 1, body: op.i32Const(HEAP_BASE) },
+      mwf_free: { params: 2, body: [] },
+      mwf_execute: {
+        params: 2,
+        body: concat(
+          op.loop(),
+          op.br(0), // 回到 loop 开头，永不退出
+          op.end(),
+          op.i32Const(0), // 类型检查需要的返回值（实际不可达）
         ),
       },
     },

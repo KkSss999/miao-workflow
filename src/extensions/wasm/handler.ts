@@ -4,12 +4,24 @@ import type { StepHandler, StepResult } from "../../core/runner.js";
 import type { JsonObject } from "../../json.js";
 import { buildWasmRequest, type WasmStepErrorPayload } from "./abi.js";
 import { WasmHostError } from "./errors.js";
-import { WasmStepModule, loadWasmModule, type WasmModuleOptions } from "./instance.js";
+import { loadWasmModule } from "./instance.js";
+import type { WasmStepInvoker } from "./invoker.js";
 import type { WasmSource } from "./runtime.js";
+import { WasmWorkerHost, type WasmWorkerHostOptions } from "./worker-host.js";
 
-export interface WasmHandlerOptions extends WasmModuleOptions {
+export interface WasmHandlerOptions extends WasmWorkerHostOptions {
   /** 注册用的名字；只影响错误信息 */
   handlerName?: string;
+
+  /**
+   * 执行模式：
+   *
+   * - `"inline"`（默认）：同线程同步调用。最快，但模块里的死循环会阻塞事件循环，
+   *   `step.timeoutMs` 拦不住它。**只适合自己写的、可信的模块。**
+   * - `"worker"`：独立线程执行。超时（`step.timeoutMs` 或 `timeoutMs`）
+   *   会 **terminate** 那个线程 —— 死循环模块也能被干掉。**第三方模块用这个。**
+   */
+  execution?: "inline" | "worker";
 }
 
 /**
@@ -18,19 +30,37 @@ export interface WasmHandlerOptions extends WasmModuleOptions {
  * Core 完全不知道这是 wasm —— 它拿到的东西和其他 handler 一模一样。
  * 这就是「extension 而不是 Core」的具体含义。
  */
-export function createWasmHandler(source: WasmSource, options: WasmHandlerOptions = {}): StepHandler {
-  const loaded = loadWasmModule(source, {
-    ...options,
-    ...(options.handlerName === undefined ? {} : { name: options.handlerName }),
-  });
-  return handlerFor(loaded);
+/**
+ * 比普通 StepHandler 多一个 `dispose()` —— worker 模式要释放线程。
+ * `StepHandler` 本身没有生命周期概念（Core 也不需要有），所以这是扩展自己的约定。
+ */
+export interface WasmStepHandler extends StepHandler {
+  dispose(): Promise<void>;
 }
 
-/** 复用同一个模块实例（推荐：模块实例化不便宜，而且这样内存复用更可控）。 */
-export function handlerFor(module: WasmStepModule): StepHandler {
+export function createWasmHandler(source: WasmSource, options: WasmHandlerOptions = {}): WasmStepHandler {
+  const name = options.handlerName;
+  const common = {
+    ...options,
+    ...(name === undefined ? {} : { name }),
+  };
+
+  // worker 模式是**懒启动**的：第一次调用时才起线程，注册保持同步
+  const invoker: WasmStepInvoker =
+    options.execution === "worker" ? new WasmWorkerHost(source, common) : loadWasmModule(source, common);
+
+  const handler = handlerFor(invoker);
+  return { ...handler, dispose: async () => invoker.dispose?.() };
+}
+
+/** 复用同一个模块实例 / worker（推荐：实例化与起线程都不便宜）。 */
+export function handlerFor(invoker: WasmStepInvoker): StepHandler {
   return {
     async execute(context, config): Promise<StepResult> {
-      const response = module.invoke(buildWasmRequest(context, isJsonObject(config) ? config : undefined));
+      const response = await invoker.invoke(
+        buildWasmRequest(context, isJsonObject(config) ? config : undefined),
+        context.signal,
+      );
 
       switch (response.status) {
         case "completed":
@@ -44,7 +74,7 @@ export function handlerFor(module: WasmStepModule): StepHandler {
             ? { status: "waiting", waitFor: response.waitFor }
             : { status: "waiting", waitFor: response.waitFor, wakeAt: response.wakeAt };
         case "failed":
-          return { status: "failed", error: toWorkflowError(response.error, module.name) };
+          return { status: "failed", error: toWorkflowError(response.error, invoker.name) };
       }
     },
   };
@@ -96,5 +126,6 @@ function isJsonObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-export { WasmHostError, WasmStepModule, loadWasmModule };
-export type { WasmModuleOptions };
+export { WasmHostError, WasmWorkerHost, loadWasmModule };
+export type { WasmWorkerHostOptions };
+export type { WasmStepInvoker };

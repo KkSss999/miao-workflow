@@ -81,23 +81,44 @@ mwf_execute 返回 respPtr，内存里是：
 | 响应长度超过 `maxResponseBytes`（默认 8 MiB）或越界 | 执行失败（`wasm.bounds`） |
 | 响应不是合法 JSON / status 不合法 | 执行失败（`wasm.response`） |
 | 模块 trap（`unreachable` 等） | 执行失败（`wasm.trap`），`retryable: false` |
-| 执行超过 `maxDurationMs` | 执行失败（`wasm.overrun`，code `STEP_TIMEOUT`） |
+| 执行超过 `maxDurationMs` / `timeoutMs` / `step.timeoutMs` | inline 模式：事后审计（`wasm.overrun`）；**worker 模式：terminate 掉线程** |
 
 失败一律包成 `WasmHostError extends WorkflowError`（code `STEP_FAILED`，`retryable: false`），
 所以它进 step run 的 `error` 字段、进事件流、被 UI 显示的方式和普通 handler 完全一样。
 
-## 诚实说明：同步 wasm 无法被打断
+## 两种执行模式（选一个，别猜）
 
-`mwf_execute` 是**同步**调用：模块里的死循环会阻塞整个 Node 事件循环，
-`StepRunner` 的 `Promise.race` 超时**救不了它**（事件循环都没了）。
+`mwf_execute` 是**同步**调用，所以「谁来保证它不失控」有两种答案：
 
-所以 v1 的定位是明确的：
+| | `execution: "inline"`（默认） | `execution: "worker"` |
+|---|---|---|
+| 线程 | 同线程 | 独立 worker_threads |
+| 速度 | 最快（无跨线程开销） | 每次调用多一次结构化克隆 + 线程切换 |
+| 死循环 | **会焊死整个事件循环**，`step.timeoutMs` 拦不住 | **`terminate()` 掉**，`step.timeoutMs` 真生效 |
+| 适合 | 自己写的、可信的模块 | **第三方模块** |
 
-- wasm handler 必须是**有界的纯计算**（毫秒级）
-- `maxDurationMs` 是**事后审计**而不是熔断：超了会被标成失败，但进程已经卡过了
-- 真需要不可信代码隔离时，走 **F.1：worker_threads 执行模式**（模块跑在 worker 里，
-  超时 = terminate worker）。这一步的代价是要把 JSON 编解码搬到 worker 边界上 ——
-  好消息是 ABI 已经就是 JSON，搬过去不用改协议
+```ts
+// 第三方模块：放 worker 里跑
+registerWasmHandlers(
+  registry,
+  { "text.extract": bytes },
+  { execution: "worker", timeoutMs: 1_000 },
+);
+```
+
+worker 模式的细节：
+
+- **懒启动**：第一次调用才起线程，注册保持同步
+- **超时来源**：`timeoutMs` / `maxDurationMs` 选项，**以及 `step.timeoutMs`**
+  （`StepRunner` 通过 `AbortSignal` 传进来）。任一触发都走 `worker.terminate()`
+- **自动恢复**：被掐掉之后，下一次调用会重起一个干净的 worker
+- **串行**：同一个 host 一次只跑一个调用；要并行就多建几个 host
+- **生命周期**：`createWasmHandler()` 返回的 handler 带 `dispose()`，记得在退出时调用
+  （worker 空闲时是 `unref` 的，所以忘了也不会吊住进程）
+
+worker 里**没有 IO 能力**：线程入口只做 WebAssembly 调用，不暴露 `fs` / `net` / 时钟，
+也不接受模块的 import（除非宿主显式白名单化地传）。所以「独立线程」是隔离与可中断，
+不是提权。
 
 ## 一个 fixture 长什么样
 

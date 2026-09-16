@@ -89,9 +89,17 @@ pnpm build      # tsc → dist/
 3. **默认不给任何 import**（沙箱里没有 fetch / fs / 时钟）；要能力必须显式白名单化传进去。
 4. **不引用全局 `WebAssembly` 类型**：`src/extensions/wasm/runtime.ts` 里是手搓的结构性接口。
    理由：`WebAssembly` 的类型只在 `lib.dom` / `lib.webworker`，写它会逼消费者给 tsconfig 加 DOM lib。
-5. **同步 wasm 无法被打断**：`maxDurationMs` 只做事后审计，不是熔断。
-   要跑不可信模块只能走 F.1（worker_threads）。
-6. **测试夹具是手搓的 wasm 二进制**（`tests/support/wasm-fixtures.ts`）：机器上没有 wasm 工具链
+5. **同步 wasm 无法被打断** —— 所以有两种执行模式，别搞混：
+   - `"inline"`（默认）：同线程。`maxDurationMs` 只做事后审计，**不是熔断**；只适合可信模块
+   - `"worker"`：独立线程。超时（`timeoutMs` / `maxDurationMs` / `step.timeoutMs` 的 AbortSignal）
+     = `worker.terminate()`，被掐掉后下次调用自动重起。**第三方模块一律用这个**
+6. **worker 入口必须是纯 JS**（`worker-entry.js`）：它由 `new Worker(new URL("./worker-entry.js",
+   import.meta.url))` 启动，src 模式与 dist 模式解析到同一个相对路径。写成 .ts 会有两个坑：
+   Node 的类型剥离不会把 `./x.js` 重映射回 `./x.ts`；tsc 也不会把 .js 拷进 dist ——
+   所以 `pnpm build` 里专门有一句 `scripts/copy-wasm-worker.mjs`。改 worker 协议时两边都要改。
+7. **worker 只回传响应文本**，JSON 解析与语义校验统一在宿主侧的 `decodeResponse` ——
+   校验只有一处；worker 那边只做 bounds 之类它自己必须做的检查（有测试盯着两边 kind 一致）。
+8. **测试夹具是手搓的 wasm 二进制**（`tests/support/wasm-fixtures.ts`）：机器上没有 wasm 工具链
    （clang 没 backend、rustc 只有 wasip2 组件模型）。改 ABI 时夹具要同步改 —— 它就是协议的可执行文档。
 
 ## Phase A 定下来的语义（改之前先读懂，否则会破坏崩溃恢复）
@@ -139,5 +147,6 @@ pnpm schema:sync    # src/storage/schema.ts → docs/postgres-schema.sql
 
 1. **IntakeOps 真实接入**：`examples/intakeops/handlers.ts` 里注释掉的 service 调用换成真实实现
    （编排层零改动），跑一遍真实 run
-2. **F.1**：worker_threads 执行模式（不可信 wasm 模块的超时 = terminate）
+2. **可选的 V2 候选**（都还没做，也别顺手做）：并行 DAG / 子流程 / 循环 + compensation、
+   BullMQ worker adapter、Canvas、多租户
 3. 想加功能之前先回看 README 的「明确不做」清单

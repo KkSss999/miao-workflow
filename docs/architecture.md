@@ -250,8 +250,7 @@ RBAC · 多租户 · Connector 市场 · Redis 依赖 · Kubernetes · 分布式
 | **B** | PostgresStorage · Run/StepRun/Events · 版本化 | `kill -9` → 重启 → 继续 | ✅ 完成 |
 | **C** | Retry 端到端 · Lease · Crash Recovery · UNKNOWN | 崩溃与重复都不出错 | ✅ 完成 |
 | **D** | Signal · Wait · Resume · Delay · Cancel | **Core V1 完成** | ✅ 完成 |
-| **F** | WASM handler 宿主（`@catease/workflow/wasm`） | 第三方打包一个 wasm 就接进来 | ✅ 完成 |
-| **F.1** | worker_threads 执行模式 | 不可信模块可被 terminate | — |
+| **F** | WASM handler 宿主（`@catease/workflow/wasm`） | 第三方打包一个 wasm 就接进来，含线程隔离执行模式 | ✅ 完成 |
 
 E（包住 IntakeOps）不再作为阶段 —— D 完成之后顺手验证即可。
 
@@ -373,8 +372,15 @@ async execute(ctx) {
 以及一个**手搓的 wasm 二进制编码器**作为测试夹具 —— 机器上没有可用的 wasm 工具链，
 所以夹具是直接按 spec 写字节生成的（顺便成了 ABI 的可执行文档）。
 
-**已知限制（不藏）**：同步 wasm 无法被中断，死循环会阻塞事件循环，
-所以要跑不可信模块必须走 F.1（worker_threads）。
+**同步 wasm 无法被中断** —— 这一条我们不给「假装超时」的答案，而是给两种执行模式：
+
+- `execution: "inline"`（默认）：同线程，最快，只适合可信模块
+- `execution: "worker"`：独立 worker_threads，超时（`timeoutMs` 或 `step.timeoutMs`）
+  = `terminate()`；被掐掉后下一次调用自动重起干净的 worker。
+  **第三方模块一律用这个。**
+
+线程里没有任何 IO 能力，也不接受模块的 import（除非宿主显式白名单化地传）——
+隔离换来的是「可中断」，不是「提权」。
 
 ## 测试即规格
 

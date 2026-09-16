@@ -151,7 +151,8 @@ export {
 } from "./runtime/step-run.js";
 export type { StepRun, StepRunPatch, StepStatus } from "./runtime/step-run.js";
 
-export type { SignalInput, WorkflowSignal } from "./runtime/signal.js";
+export { isSignalEligible } from "./runtime/signal.js";
+export type { SignalOptions, WorkflowSignal } from "./runtime/signal.js";
 export type { WorkflowEvent, WorkflowEventType } from "./runtime/events.js";
 
 export {
@@ -176,7 +177,7 @@ export { MemoryWorkflowStorage } from "./storage/memory.js";
 export type { MemoryStorageOptions } from "./storage/memory.js";
 export { PostgresWorkflowStorage } from "./storage/postgres.js";
 export type { PostgresStorageOptions, SqlClient, SqlQueryResult } from "./storage/postgres.js";
-export { CLAIM_DUE_SQL, CONSUME_SIGNAL_SQL, SCHEMA_SQL } from "./storage/schema.js";
+export { CLAIM_DUE_SQL, CONSUME_SIGNAL_SQL, SCHEMA_SQL, SCHEMA_VERSION } from "./storage/schema.js";
 export type {
   ClaimOptions,
   DefinitionRecord,
@@ -191,7 +192,12 @@ export type {
 // ── Worker ─────────────────────────────────────────────────────
 export { WorkflowWorker } from "./worker/worker.js";
 export type { WorkerTickResult, WorkflowWorkerOptions } from "./worker/worker.js";
-export { DEFAULT_LEASE_MS, DEFAULT_LEASE_RENEW_INTERVAL_MS, LeaseManager } from "./worker/lease.js";
-export type { LeaseManagerOptions } from "./worker/lease.js";
+export {
+  DEFAULT_LEASE_MS,
+  DEFAULT_LEASE_RENEW_INTERVAL_MS,
+  DEFAULT_MAX_CONSECUTIVE_FAILURES,
+  LeaseManager,
+} from "./worker/lease.js";
+export type { HeartbeatOptions, LeaseManagerOptions } from "./worker/lease.js";
 export { DEFAULT_POLL_INTERVAL_MS, DEFAULT_POLL_JITTER_MS, Scheduler } from "./worker/scheduler.js";
 export type { SchedulerOptions } from "./worker/scheduler.js";

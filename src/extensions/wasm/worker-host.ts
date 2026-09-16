@@ -85,6 +85,10 @@ export class WasmWorkerHost implements WasmStepInvoker {
 
   async dispose(): Promise<void> {
     this.#disposed = true;
+    // 竞态：dispose 时可能有一个 #start 正在飞 —— 等它落定再 kill，
+    // 否则它会在线程已经被判死刑之后把 #worker 重新赋值，等于漏一个线程出来。
+    const starting = this.#starting;
+    if (starting !== null) await starting.catch(() => undefined);
     await this.#kill(
       new WasmHostError(`wasm worker "${this.name}" 已释放`, { kind: "wasm.trap", moduleName: this.name }),
     );
@@ -163,6 +167,9 @@ export class WasmWorkerHost implements WasmStepInvoker {
 
   async #ensureWorker(): Promise<Worker> {
     if (this.#worker !== null) return this.#worker;
+    if (this.#disposed) {
+      throw new WasmHostError(`wasm worker "${this.name}" 已释放`, { kind: "wasm.trap", moduleName: this.name });
+    }
     if (this.#starting === null) {
       this.#starting = this.#start().finally(() => {
         this.#starting = null;

@@ -88,15 +88,38 @@ export interface StepRunStore {
   countByRun(runId: string): Promise<number>;
 }
 
+export interface WaitContext {
+  /** 步骤在等什么（step run 的 waitFor） */
+  name: string;
+  /** 哪一个 step 在等（用于定向信号） */
+  stepId: string;
+  /** 这次等待的信号水位线（step run 的 waitSinceSeq） */
+  sinceSeq: number;
+}
+
+export interface ConsumeSignalInput extends WaitContext {
+  runId: string;
+  now?: string;
+}
+
 export interface SignalStore {
-  append(signal: WorkflowSignal): Promise<void>;
   /**
-   * 消费最老的一条未消费信号，并原子地打上 consumed_at。
+   * 入队一条信号。
    *
-   * 同一条信号只能被消费一次 —— 重复点两次「Approve」不会推进两次。
-   * 没有未消费信号时返回 null。
+   * `seq` 由 storage 分配（Postgres 是 identity 列，内存实现是自增计数器）——
+   * 调用方传进来的 seq 会被忽略，返回值以 storage 分配的为准。
    */
-  consumeNext(runId: string, name: string, now?: string): Promise<WorkflowSignal | null>;
+  append(signal: Omit<WorkflowSignal, "seq">): Promise<WorkflowSignal>;
+  /** 当前该 run 的信号水位线（= 已入队信号的最大 seq，没有则 0）。 */
+  watermark(runId: string): Promise<number>;
+  /**
+   * 消费最老的一条**对这次等待可用**的信号，并原子地打上 consumed_at。
+   *
+   * 可用性规则见 `isSignalEligible`：名字一致 + （定向且 step 对上）或（未定向且到得比等待晚）。
+   * 同一条信号只能被消费一次 —— 重复点两次「Approve」不会推进两次。
+   * 没有可用信号时返回 null。
+   */
+  consumeNext(input: ConsumeSignalInput): Promise<WorkflowSignal | null>;
   listByRun(runId: string): Promise<WorkflowSignal[]>;
   countPending(runId: string): Promise<number>;
 }
@@ -104,6 +127,13 @@ export interface SignalStore {
 export interface EventStore {
   /** 只追加，永不修改 */
   append(event: WorkflowEvent): Promise<void>;
+  /**
+   * 按 run 读取审计事件（插入顺序）。
+   *
+   * @param options.after 上一页最后一条事件的 id（游标）。
+   *   **游标不存在时抛 ValidationError** —— 两个适配器行为必须一致，
+   *   否则「内存里返回全部、库里返回空」这种分歧会变成线上翻页事故。
+   */
   listByRun(runId: string, options?: { limit?: number; after?: string }): Promise<WorkflowEvent[]>;
 }
 
@@ -113,6 +143,8 @@ export interface WorkflowStorage {
   readonly steps: StepRunStore;
   readonly signals: SignalStore;
   readonly events: EventStore;
-  /** 建表 / 迁移。Memory 实现是 no-op。 */
+  /** 建表 / 迁移（幂等）。Memory 实现是 no-op。 */
   migrate(): Promise<void>;
+  /** 当前 schema 版本（Memory 与 Postgres 都返回 SCHEMA_VERSION）。 */
+  schemaVersion(): Promise<number>;
 }

@@ -7,6 +7,17 @@ export const DEFAULT_LEASE_MS = 30_000;
 /** 心跳间隔必须显著小于租期，否则会自己把自己判成过期。 */
 export const DEFAULT_LEASE_RENEW_INTERVAL_MS = 10_000;
 
+/** 连续失败多少次就认为「lease 保不住了」。默认 3 次。 */
+export const DEFAULT_MAX_CONSECUTIVE_FAILURES = 3;
+
+export interface HeartbeatOptions {
+  /** lease 确认丢了（续租返回 false，或连续失败到阈值） */
+  onLost?: () => void;
+  /** 续租过程中的异常，用于上报/打日志 */
+  onError?: (error: unknown) => void;
+  maxConsecutiveFailures?: number;
+}
+
 export interface LeaseManagerOptions {
   runs: RunStore;
   /** worker 标识，写进 lease_owner */
@@ -61,16 +72,37 @@ export class LeaseManager {
 
   /**
    * 给一个正在处理的 run 挂心跳。
+   *
    * @returns stop 函数（务必在 finally 里调用）
+   *
+   * 续租失败（数据库抖动、连接池耗尽）**必须被吞掉并上报**：
+   * 这里是 `setInterval` 回调，一旦漏出 rejection，Node 默认的
+   * `--unhandled-rejections=throw` 会直接把整个 worker 进程干掉 ——
+   * 而心跳存在的意义恰恰是「数据库不重要，反正会恢复」。
    */
-  startHeartbeat(runId: string, onLost?: () => void): () => void {
+  startHeartbeat(runId: string, options: HeartbeatOptions = {}): () => void {
+    const { onLost, onError, maxConsecutiveFailures = DEFAULT_MAX_CONSECUTIVE_FAILURES } = options;
+    let failures = 0;
+
     const timer = setInterval(() => {
-      void this.renew(runId).then((renewed) => {
-        if (!renewed) {
-          onLost?.();
-          stop();
-        }
-      });
+      void this.renew(runId).then(
+        (renewed) => {
+          failures = 0;
+          if (!renewed) {
+            onLost?.();
+            stop();
+          }
+        },
+        (error: unknown) => {
+          failures += 1;
+          onError?.(error);
+          if (failures >= maxConsecutiveFailures) {
+            // 连续失败到阈值：我们已经无法证明 lease 还在自己手里，停手更安全
+            onLost?.();
+            stop();
+          }
+        },
+      );
     }, this.renewIntervalMs);
     timer.unref?.();
 

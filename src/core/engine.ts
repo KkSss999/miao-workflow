@@ -9,6 +9,7 @@ import type { WorkflowEventType } from "../runtime/events.js";
 import { computeBackoffMs, normalizeRetryPolicy, shouldRetry } from "../runtime/retry.js";
 import { isTerminalRunStatus, type RunStatus, type WorkflowRun, type WorkflowRunPatch } from "../runtime/run.js";
 import type { StepRun } from "../runtime/step-run.js";
+import type { SignalOptions } from "../runtime/signal.js";
 import type { WorkflowStorage } from "../storage/interface.js";
 import {
   DefinitionNotFoundError,
@@ -106,6 +107,12 @@ export class WorkflowEngine {
     this.storage = options.storage;
     this.registry = options.registry ?? createRegistry();
     this.limits = { ...DEFAULT_ENGINE_LIMITS, ...options.limits };
+    if (!Number.isInteger(this.limits.maxStepsPerTick) || this.limits.maxStepsPerTick < 1) {
+      // 0 / 负数会让 run 永远推不动，worker 还会空转 —— 启动时就该炸
+      throw new ValidationError(`maxStepsPerTick 必须是 >= 1 的整数，收到 ${this.limits.maxStepsPerTick}`, {
+        details: { maxStepsPerTick: this.limits.maxStepsPerTick },
+      });
+    }
     this.now = options.now ?? (() => new Date());
     this.#newId = options.newId ?? (() => randomUUID());
     this.#random = options.random ?? (() => Math.random());
@@ -199,14 +206,31 @@ export class WorkflowEngine {
    *
    * run 会被「有匹配的未消费信号」这个条件捞起来（见 storage 的 claimDue）。
    */
-  async signal(runId: string, name: string, payload?: JsonValue): Promise<void> {
+  async signal(
+    runId: string,
+    name: string,
+    payload?: JsonValue,
+    options: SignalOptions = {},
+  ): Promise<void> {
     const run = await this.#requireRun(runId);
     if (isTerminalRunStatus(run.status)) throw new RunNotActiveError(runId, run.status);
+
+    const stepId = options.stepId ?? null;
+    if (stepId !== null) {
+      // 定向就该校验：打错 step 名字和打错信号名字一样致命，而且更难查
+      const definition = await this.#requireDefinitionVersion(run);
+      if (!Object.hasOwn(definition.steps, stepId)) {
+        throw new ValidationError(`run "${runId}" 的 workflow 里没有 step "${stepId}"`, {
+          details: { runId, stepId, workflowId: run.workflowId, version: run.workflowVersion },
+        });
+      }
+    }
 
     await this.storage.signals.append({
       id: this.#newId(),
       runId,
       name,
+      stepId,
       payload,
       createdAt: this.#nowIso(),
       consumedAt: null,
@@ -214,6 +238,7 @@ export class WorkflowEngine {
 
     await this.#emit(runId, null, "signal.received", {
       name,
+      ...(stepId === null ? {} : { stepId }),
       ...(payload === undefined ? {} : { payload }),
     });
   }
@@ -293,6 +318,23 @@ export class WorkflowEngine {
 
     const definition = await this.#requireDefinitionVersion(run);
 
+    try {
+      return await this.#runLoop(run, definition, owner, leaseMs);
+    } finally {
+      // 所有出口统一释放：WAITING / 终态 / 撞上限 / 抛错都一样。
+      // 释放用的是 owner，别人抢不走的前提下这永远是幂等的。
+      if (owner !== undefined) await this.storage.runs.releaseLease(run.id, owner);
+    }
+  }
+
+  async #runLoop(
+    initialRun: WorkflowRun,
+    definition: WorkflowDefinition,
+    owner: string | undefined,
+    leaseMs: number | undefined,
+  ): Promise<TickResult> {
+    let run = initialRun;
+
     // 挂起解不解得开？
     //
     // 注意：判断依据是**当前 step run 的状态**，不是 run.status ——
@@ -308,7 +350,6 @@ export class WorkflowEngine {
         if (run.status !== "WAITING") {
           run = await this.#setRun(run, { status: "WAITING", wakeAt: waitingStep.wakeAt });
         }
-        if (owner !== undefined) await this.storage.runs.releaseLease(run.id, owner);
         return { steps: 0, status: "WAITING" };
       }
 
@@ -326,7 +367,14 @@ export class WorkflowEngine {
 
     let steps = 0;
     while (steps < this.limits.maxStepsPerTick) {
-      const stepId = run.currentStepId ?? definition.start;
+      // 非终态的 run 必须有明确的当前步骤。这里**不能** fallback 到 definition.start ——
+      // 那等于把整个 workflow 从头重跑一遍（重复副作用），比直接报错危险得多。
+      if (run.currentStepId === null) {
+        throw new ValidationError(`run "${run.id}" 状态是 ${run.status}，但没有 currentStepId`, {
+          details: { runId: run.id, status: run.status },
+        });
+      }
+      const stepId = run.currentStepId;
       const step = definition.steps[stepId];
       if (step === undefined) {
         throw new ValidationError(`run "${run.id}" 指向不存在的 step "${stepId}"`, {
@@ -435,8 +483,9 @@ export class WorkflowEngine {
           const policy = normalizeRetryPolicy(step.retry);
           const retryable = outcome.stepRun.error?.retryable ?? false;
 
-          if (retryable && shouldRetry(policy, outcome.stepRun.attempt)) {
-            const delayMs = computeBackoffMs(policy, outcome.stepRun.attempt, this.#random);
+          // 用 failures 而不是 attempt：等待被唤醒重新执行不该吃掉重试预算
+          if (retryable && shouldRetry(policy, outcome.stepRun.failures)) {
+            const delayMs = computeBackoffMs(policy, outcome.stepRun.failures, this.#random);
             run = await this.#setRun(run, {
               status: "RETRYING",
               wakeAt: this.#isoAfter(delayMs),
@@ -467,7 +516,6 @@ export class WorkflowEngine {
     }
 
     // 撞上 maxStepsPerTick：交回队列，下一轮从 currentStepId 继续（这不是错误）
-    if (owner !== undefined) await this.storage.runs.releaseLease(run.id, owner);
     return { steps, status: run.status };
   }
 
@@ -483,7 +531,13 @@ export class WorkflowEngine {
     const waitFor = active.waitFor;
 
     if (waitFor !== null) {
-      const signal = await this.storage.signals.consumeNext(run.id, waitFor, at);
+      const signal = await this.storage.signals.consumeNext({
+        runId: run.id,
+        name: waitFor,
+        stepId: active.stepId,
+        sinceSeq: active.waitSinceSeq ?? 0,
+        now: at,
+      });
       if (signal !== null) {
         // 落库：万一接下来这一步失败重试，信号还在
         await this.storage.steps.update(active.id, { waitPayload: signal.payload });
@@ -642,8 +696,8 @@ export class WorkflowClient {
     return this.engine.start(workflow, options);
   }
 
-  async signal(runId: string, name: string, payload?: JsonValue): Promise<void> {
-    return this.engine.signal(runId, name, payload);
+  async signal(runId: string, name: string, payload?: JsonValue, options?: SignalOptions): Promise<void> {
+    return this.engine.signal(runId, name, payload, options);
   }
 
   async cancel(runId: string): Promise<WorkflowRun> {

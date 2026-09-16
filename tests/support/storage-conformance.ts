@@ -2,12 +2,14 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import {
   Registry,
+  SCHEMA_VERSION,
   StorageConflictError,
   WorkflowEngine,
   buildIdempotencyKey,
   defineWorkflow,
   hashDefinition,
 } from "../../src/index.js";
+import type { ConsumeSignalInput } from "../../src/storage/interface.js";
 import type { StepHandler, WorkflowDefinition, WorkflowStorage } from "../../src/index.js";
 import {
   CONFORMANCE_START,
@@ -142,7 +144,7 @@ export function describeStorageConformance(title: string, harness: StorageHarnes
         expect(claimed.map((item) => item.id)).toEqual(["delayed"]);
       });
 
-      it("等信号的 WAITING：没有信号抢不到；来了匹配的信号就能抢到", async () => {
+      it("等信号的 WAITING：只有「可用」的信号才让它可抢", async () => {
         await storage.runs.create(makeRun("waiting", at(), { status: "WAITING", wakeAt: null }));
         await storage.steps.create(
           makeStepRun(at(), {
@@ -151,6 +153,7 @@ export function describeStorageConformance(title: string, harness: StorageHarnes
             stepId: "approve",
             status: "WAITING",
             waitFor: "approval",
+            waitSinceSeq: 0,
             output: undefined,
             patch: undefined,
           }),
@@ -165,10 +168,43 @@ export function describeStorageConformance(title: string, harness: StorageHarnes
         await storage.signals.append(makeSignal(at(), { id: "s-payment", runId: "waiting", name: "payment" }));
         expect(await storage.runs.claimDue({ owner: "A", limit: 10, leaseMs: 30_000, now: at() })).toEqual([]);
 
-        // 名字对上了 → 可抢（这也是 signal 没有崩溃窗口的原因：run 不需要被叫醒，它自己变成可抢）
+        // 名字对上但「入队在等待之前」且未定向 → 依然不抢（否则就是陈旧信号冒领）
+        const stale = await storage.signals.append(
+          makeSignal(at(), { id: "s-stale", runId: "waiting", name: "approval" }),
+        );
+        await storage.steps.update("sr-wait", { waitSinceSeq: stale.seq });
+        expect(await storage.runs.claimDue({ owner: "A", limit: 10, leaseMs: 30_000, now: at() })).toEqual([]);
+
+        // 等待开始之后入队的信号 → 可抢（这也是 signal 没有崩溃窗口的原因：run 自己变成可抢）
         await storage.signals.append(makeSignal(at(), { id: "s-approval", runId: "waiting", name: "approval" }));
         const claimed = await storage.runs.claimDue({ owner: "A", limit: 10, leaseMs: 30_000, now: at() });
         expect(claimed.map((item) => item.id)).toEqual(["waiting"]);
+      });
+
+      it("定向给这个 step 的信号即使入队更早，也让它可抢", async () => {
+        await storage.runs.create(makeRun("waiting2", at(), { status: "WAITING", wakeAt: null }));
+        await storage.steps.create(
+          makeStepRun(at(), {
+            id: "sr-wait2",
+            runId: "waiting2",
+            stepId: "approve",
+            status: "WAITING",
+            waitFor: "approval",
+            waitSinceSeq: 0,
+            output: undefined,
+            patch: undefined,
+          }),
+        );
+        await storage.runs.update("waiting2", { currentStepId: "approve", currentStepRunId: "sr-wait2" });
+
+        const targeted = await storage.signals.append(
+          makeSignal(at(), { id: "s-targeted", runId: "waiting2", name: "approval", stepId: "approve" }),
+        );
+        await storage.steps.update("sr-wait2", { waitSinceSeq: targeted.seq });
+
+        clock.advance(1_000);
+        const claimed = await storage.runs.claimDue({ owner: "A", limit: 10, leaseMs: 30_000, now: at() });
+        expect(claimed.map((item) => item.id)).toEqual(["waiting2"]);
       });
 
       it("续租只能续自己的；release 之后别人立刻能接手", async () => {
@@ -246,6 +282,27 @@ export function describeStorageConformance(title: string, harness: StorageHarnes
         expect(stepRun?.output).toEqual({ y: 2 });
         expect(stepRun?.visit).toBe(1);
       });
+
+      it("等待相关的字段（waitFor / waitSinceSeq / waitPayload）能存能取", async () => {
+        await storage.runs.create(makeRun("run-1", at()));
+        await storage.steps.create(
+          makeStepRun(at(), { status: "WAITING", waitFor: "approval", waitSinceSeq: 7, waitPayload: { by: "gery" } }),
+        );
+
+        const stepRun = await storage.steps.get("sr-1");
+        expect(stepRun?.waitFor).toBe("approval");
+        expect(stepRun?.waitSinceSeq).toBe(7);
+        expect(stepRun?.waitPayload).toEqual({ by: "gery" });
+      });
+
+      it("failures 计数与 attempt 分开存", async () => {
+        await storage.runs.create(makeRun("run-1", at()));
+        await storage.steps.create(makeStepRun(at(), { attempt: 3, failures: 2 }));
+
+        expect((await storage.steps.get("sr-1"))?.failures).toBe(2);
+        await storage.steps.update("sr-1", { failures: 3 });
+        expect((await storage.steps.get("sr-1"))?.failures).toBe(3);
+      });
     });
 
     describe("signals", () => {
@@ -253,21 +310,38 @@ export function describeStorageConformance(title: string, harness: StorageHarnes
         await storage.runs.create(makeRun("run-1", at()));
       });
 
+      /** 一次等待：`sinceSeq` 是水位线（入队序号 <= 它的信号都算「等待之前来的」） */
+      function wait(sinceSeq: number, stepId = "approve"): ConsumeSignalInput {
+        return { runId: "run-1", name: "approval", stepId, sinceSeq, now: at() };
+      }
+
+      it("append 会分配单调递增的 seq，watermark 跟着涨", async () => {
+        expect(await storage.signals.watermark("run-1")).toBe(0);
+
+        const first = await storage.signals.append(makeSignal(at(), { id: "s-1" }));
+        clock.advance(1_000);
+        const second = await storage.signals.append(makeSignal(at(), { id: "s-2" }));
+
+        expect(second.seq).toBeGreaterThan(first.seq);
+        expect(await storage.signals.watermark("run-1")).toBe(second.seq);
+      });
+
       it("同一条信号只能被消费一次（重复点两次 Approve 不会推进两次）", async () => {
         await storage.signals.append(makeSignal(at(), { id: "s-1" }));
         clock.advance(1_000);
         await storage.signals.append(makeSignal(at(), { id: "s-2" }));
+        const sinceSeq = 0; // 等待从最开始就登记着
 
         expect(await storage.signals.countPending("run-1")).toBe(2);
 
-        const first = await storage.signals.consumeNext("run-1", "approval", at());
+        const first = await storage.signals.consumeNext(wait(sinceSeq));
         expect(first?.id).toBe("s-1");
         expect(first?.consumedAt).not.toBeNull();
 
-        const second = await storage.signals.consumeNext("run-1", "approval", at());
+        const second = await storage.signals.consumeNext(wait(sinceSeq));
         expect(second?.id).toBe("s-2");
 
-        expect(await storage.signals.consumeNext("run-1", "approval", at())).toBeNull();
+        expect(await storage.signals.consumeNext(wait(sinceSeq))).toBeNull();
         expect(await storage.signals.countPending("run-1")).toBe(0);
         expect((await storage.signals.listByRun("run-1")).map((item) => item.id)).toEqual(["s-1", "s-2"]);
       });
@@ -277,8 +351,37 @@ export function describeStorageConformance(title: string, harness: StorageHarnes
         clock.advance(1_000);
         await storage.signals.append(makeSignal(at(), { id: "s-2", name: "payment" }));
 
-        expect((await storage.signals.consumeNext("run-1", "payment", at()))?.id).toBe("s-2");
-        expect((await storage.signals.consumeNext("run-1", "approval", at()))?.id).toBe("s-1");
+        expect((await storage.signals.consumeNext({ ...wait(0), name: "payment" }))?.id).toBe("s-2");
+        expect((await storage.signals.consumeNext(wait(0)))?.id).toBe("s-1");
+      });
+
+      it("未定向 + 入队在等待之前的信号**不会被冒领**（这就是那个 P0 bug）", async () => {
+        // 信号先到（人类手抖点了两次 / 上游重发了 webhook）
+        const stale = await storage.signals.append(makeSignal(at(), { id: "stale" }));
+        clock.advance(1_000);
+
+        // 这次等待登记时水位线已经包含它了 → 不消费
+        expect(await storage.signals.consumeNext(wait(stale.seq))).toBeNull();
+        // 它还留在队列里（可见、可重发），而不是被猜着消费掉
+        expect(await storage.signals.countPending("run-1")).toBe(1);
+
+        // 等待开始之后入队的那条才能被消费
+        await storage.signals.append(makeSignal(at(), { id: "fresh" }));
+        expect((await storage.signals.consumeNext(wait(stale.seq)))?.id).toBe("fresh");
+        expect(await storage.signals.countPending("run-1")).toBe(1);
+      });
+
+      it("定向信号不受水位线限制（发送者明确说了给哪个 step）", async () => {
+        const targeted = await storage.signals.append(makeSignal(at(), { id: "targeted", stepId: "approve" }));
+
+        expect((await storage.signals.consumeNext(wait(targeted.seq)))?.id).toBe("targeted");
+      });
+
+      it("定向给别的 step 的信号不会被这次等待消费", async () => {
+        const other = await storage.signals.append(makeSignal(at(), { id: "other", stepId: "gate-2" }));
+
+        expect(await storage.signals.consumeNext(wait(other.seq, "gate-1"))).toBeNull();
+        expect((await storage.signals.consumeNext(wait(other.seq, "gate-2")))?.id).toBe("other");
       });
     });
 
@@ -302,6 +405,12 @@ export function describeStorageConformance(title: string, harness: StorageHarnes
           "e-1",
           "e-2",
         ]);
+      });
+
+      it("游标不存在 → 报错，而不是默默返回全部/返回空", async () => {
+        await storage.events.append(makeEvent(at(), { id: "e-1" }));
+
+        await expect(storage.events.listByRun("run-1", { after: "不存在的游标" })).rejects.toThrow(/游标/);
       });
     });
 
@@ -389,6 +498,11 @@ export function describeStorageConformance(title: string, harness: StorageHarnes
         expect(calls).toEqual(["a", "b", "c"]); // 副作用没有重放（C 没有被再调一次）
         // 状态被重放：C 的 patch 从 step run 里恢复回 context
         expect((await second.get(run.id)).context).toEqual({ c: 3 });
+      });
+
+      it("schemaVersion 在 migrate 之后是一致的", async () => {
+        await storage.migrate();
+        expect(await storage.schemaVersion()).toBe(SCHEMA_VERSION);
       });
 
       it("两个 worker 抢同一个 run：只有一个拿到 lease", async () => {

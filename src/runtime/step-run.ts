@@ -38,8 +38,15 @@ export interface StepRun {
   stepId: StepId;
 
   status: StepStatus;
-  /** 当前（或最后一次）尝试次数，1-based */
+  /** 当前（或最后一次）尝试次数，1-based。**审计用**：等待被唤醒重新执行也算一次 */
   attempt: number;
+  /**
+   * 这一步**真正失败**过几次。
+   *
+   * 重试判定用这个，不用 attempt —— 否则「等待被唤醒」也会吃掉重试预算：
+   * 一个 maxAttempts=2 的审批步骤，等一次再失败就直接永久失败了。
+   */
+  failures: number;
   /** 第几次进入这个 step。V1 是顺序执行，恒为 1。 */
   visit: number;
 
@@ -56,6 +63,12 @@ export interface StepRun {
 
   /** waiting 时等的是什么（signal 名） */
   waitFor: string | null;
+  /**
+   * 这次等待的**信号水位线**：入队序号 <= 它的信号都算「这次等待之前来的」，不予消费。
+   *
+   * 这就是「同一次等待只能被之后到达的信号唤醒」的实现方式。
+   */
+  waitSinceSeq: number | null;
   waitPayload?: JsonValue;
 
   /**

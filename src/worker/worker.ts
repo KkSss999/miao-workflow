@@ -125,8 +125,10 @@ export class WorkflowWorker {
 
   async #process(runId: string): Promise<"processed" | "failed"> {
     // 心跳：handler 可能跑很久（也可能卡住），不能让 lease 在中途过期
-    const stopHeartbeat = this.lease.startHeartbeat(runId, () => {
-      this.#onError(new LeaseLostError(runId), { runId });
+    const stopHeartbeat = this.lease.startHeartbeat(runId, {
+      onLost: () => this.#onError(new LeaseLostError(runId), { runId }),
+      // 续租报错本身不是致命错误（数据库抖一下很正常），但必须被看见
+      onError: (error) => this.#onError(error, { runId }),
     });
 
     const task = (async (): Promise<"processed" | "failed"> => {

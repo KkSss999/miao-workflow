@@ -1,14 +1,17 @@
 import { randomUUID } from "node:crypto";
 
-import { StorageConflictError } from "../core/errors.js";
+import { StorageConflictError, ValidationError } from "../core/errors.js";
 import type { WorkflowDefinition } from "../definition/workflow.js";
 import type { StepId } from "../definition/step.js";
 import type { WorkflowEvent } from "../runtime/events.js";
 import { isClaimableRunStatus, isRunDue, type RunStatus, type WorkflowRun, type WorkflowRunPatch } from "../runtime/run.js";
-import type { WorkflowSignal } from "../runtime/signal.js";
+import { isSignalEligible, type WorkflowSignal } from "../runtime/signal.js";
+import { SCHEMA_VERSION } from "./schema.js";
 import type { StepRun, StepRunPatch, StepStatus } from "../runtime/step-run.js";
 import type {
   ClaimOptions,
+  ConsumeSignalInput,
+  WaitContext,
   DefinitionRecord,
   DefinitionStore,
   EventStore,
@@ -41,6 +44,7 @@ export class MemoryWorkflowStorage implements WorkflowStorage {
   readonly #runs = new Map<string, WorkflowRun>();
   readonly #stepRuns = new Map<string, StepRun>();
   readonly #signals = new Map<string, WorkflowSignal>();
+  #signalSeq = 0;
   readonly #events = new Map<string, WorkflowEvent>();
 
   readonly definitions: DefinitionStore;
@@ -62,6 +66,10 @@ export class MemoryWorkflowStorage implements WorkflowStorage {
 
   async migrate(): Promise<void> {
     // 内存实现无需建表
+  }
+
+  async schemaVersion(): Promise<number> {
+    return SCHEMA_VERSION;
   }
 
   nowIso(): string {
@@ -86,6 +94,12 @@ export class MemoryWorkflowStorage implements WorkflowStorage {
 
   signalsMap(): Map<string, WorkflowSignal> {
     return this.#signals;
+  }
+
+  /** 分配下一个信号序号（单调，跨 run 全局唯一） */
+  nextSignalSeq(): number {
+    this.#signalSeq += 1;
+    return this.#signalSeq;
   }
 
   eventsMap(): Map<string, WorkflowEvent> {
@@ -304,19 +318,31 @@ class MemoryStepRunStore implements StepRunStore {
 class MemorySignalStore implements SignalStore {
   constructor(readonly storage: MemoryWorkflowStorage) {}
 
-  async append(signal: WorkflowSignal): Promise<void> {
+  async append(signal: Omit<WorkflowSignal, "seq">): Promise<WorkflowSignal> {
     requireRunExists(this.storage, signal.runId, "signal");
     const signals = this.storage.signalsMap();
     if (signals.has(signal.id)) {
       throw new StorageConflictError(`signal "${signal.id}" 已存在`, { signalId: signal.id });
     }
-    signals.set(signal.id, clone(signal));
+    // seq 由 storage 分配，调用方传什么都不算
+    const stored: WorkflowSignal = { ...clone(signal), seq: this.storage.nextSignalSeq() };
+    signals.set(stored.id, stored);
+    return clone(stored);
   }
 
-  async consumeNext(runId: string, name: string, now?: string): Promise<WorkflowSignal | null> {
+  async watermark(runId: string): Promise<number> {
+    let max = 0;
     for (const signal of this.storage.signalsMap().values()) {
-      if (signal.runId !== runId || signal.name !== name || signal.consumedAt !== null) continue;
-      signal.consumedAt = now ?? this.storage.nowIso();
+      if (signal.runId === runId && signal.seq > max) max = signal.seq;
+    }
+    return max;
+  }
+
+  async consumeNext(input: ConsumeSignalInput): Promise<WorkflowSignal | null> {
+    for (const signal of this.storage.signalsMap().values()) {
+      if (signal.runId !== input.runId || signal.consumedAt !== null) continue;
+      if (!isSignalEligible(signal, input)) continue;
+      signal.consumedAt = input.now ?? this.storage.nowIso();
       return clone(signal);
     }
     return null;
@@ -350,7 +376,17 @@ class MemoryEventStore implements EventStore {
   async listByRun(runId: string, options: { limit?: number; after?: string } = {}): Promise<WorkflowEvent[]> {
     const all = [...this.storage.eventsMap().values()].filter((event) => event.runId === runId);
 
-    const startIndex = options.after === undefined ? 0 : all.findIndex((event) => event.id === options.after) + 1;
+    let startIndex = 0;
+    if (options.after !== undefined) {
+      const index = all.findIndex((event) => event.id === options.after);
+      if (index === -1) {
+        // 与 Postgres 对齐：游标不存在是客户端的问题，不能默默返回全部
+        throw new ValidationError(`事件游标 "${options.after}" 不存在（run ${runId}）`, {
+          details: { runId, after: options.after },
+        });
+      }
+      startIndex = index + 1;
+    }
     const sliced = all.slice(startIndex);
     return clone(options.limit === undefined ? sliced : sliced.slice(0, options.limit));
   }
@@ -376,9 +412,17 @@ function hasPendingSignalFor(
 ): boolean {
   if (run.status !== "WAITING" || run.currentStepRunId === null) return false;
   const active = stepRuns.get(run.currentStepRunId);
-  const waitFor = active?.waitFor ?? null;
-  if (waitFor === null) return false;
-  return signals.some((signal) => signal.runId === run.id && signal.name === waitFor && signal.consumedAt === null);
+  const wait = waitContextOf(active);
+  if (wait === null) return false;
+  return signals.some(
+    (signal) => signal.runId === run.id && signal.consumedAt === null && isSignalEligible(signal, wait),
+  );
+}
+
+/** step run → 等待上下文（与 SQL 里的 join 条件一一对应） */
+function waitContextOf(active: StepRun | undefined): WaitContext | null {
+  if (active === undefined || active.waitFor === null) return null;
+  return { name: active.waitFor, stepId: active.stepId, sinceSeq: active.waitSinceSeq ?? 0 };
 }
 
 /**

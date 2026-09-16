@@ -65,6 +65,9 @@ worker.start();                                   // 后台轮询推进
 
 // 几天后人类点了 Approve（web 请求里只写一条信号，不执行任何业务）
 await client.signal(run.id, "approval", { decision: "approve" });
+
+// 工作流里有多个同名 gate 时，**定向**投递才不会被冒领
+await client.signal(run.id, "approval", { decision: "approve" }, { stepId: "gate-2" });
 ```
 
 handler 的挂起写法只有一种形状 —— **同样的代码跑两次**：
@@ -176,6 +179,19 @@ docs/
   postgres-schema.sql  五张表（由 src/storage/schema.ts 生成，别手改）
   wasm-abi.md          WASM handler ABI v1 规范
 ```
+
+### 信号的归属规则（别踩）
+
+信号如果只按名字匹配，会出这种事故：**给 gate1 的第二次批准，被后面的 gate2 冒领** ——
+没有任何人批准过 gate2，它却过了。所以一条信号对某次等待「可用」的条件是：
+
+- 名字一致，且
+- **定向的**（`options.stepId`）：step 对上即可，到得早也算（发送者明确说了给谁）
+- **未定向的**：必须**在这次等待登记之后入队**（比较的是信号序列号 `seq` 与等待的水位线
+  `waitSinceSeq`，不是时间戳 —— 墙钟有同毫秒碰撞，跨进程还会不一致）
+
+不满足条件的信号会**留在队列里**（可见、可重发），而不是被猜着消费。
+代价是「等待登记之前到达的未定向信号不会唤醒本次等待」—— 这个方向的错误可恢复，反方向不可恢复。
 
 ## 三条不能破的规矩
 

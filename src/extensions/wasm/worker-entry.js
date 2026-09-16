@@ -30,6 +30,7 @@ const decoder = new TextDecoder("utf-8", { fatal: true });
 let exportsRef = null;
 let memory = null;
 let maxResponseBytes = 8 * 1024 * 1024;
+let maxMemoryBytes = null;
 
 port.on("message", (message) => {
   const id = message.id;
@@ -59,6 +60,7 @@ port.on("message", (message) => {
 
 function load(message) {
   maxResponseBytes = message.maxResponseBytes ?? maxResponseBytes;
+  maxMemoryBytes = message.maxMemoryBytes ?? null;
 
   let compiled;
   try {
@@ -114,6 +116,13 @@ function invoke(request) {
     throw fail("wasm.trap", `执行时 trap：${errorMessage(error)}`);
   } finally {
     if (typeof exports.mwf_free === "function") exports.mwf_free(requestPtr, payload.byteLength);
+  }
+
+  if (maxMemoryBytes !== null && memory.buffer.byteLength > maxMemoryBytes) {
+    throw fail(
+      "wasm.bounds",
+      `模块把内存涨到了 ${memory.buffer.byteLength} 字节，超过上限 ${maxMemoryBytes}`,
+    );
   }
 
   assertRange(responsePtr, 4, "mwf_execute 返回的指针");

@@ -8,6 +8,15 @@
  * 包对外只发布 `dist/`，读文件在消费方那边随时会失效；内联字符串永远可用。
  */
 
+/**
+ * 当前 schema 版本。
+ *
+ * `SCHEMA_SQL` 是**全量 DDL**（第一次部署用），`workflow_schema_migrations` 记录已应用的版本。
+ * 以后要加列/改类型：写一条新的迁移语句、把 SCHEMA_VERSION +1、在 migrate() 里按版本应用 ——
+ * 不要指望 `CREATE TABLE IF NOT EXISTS` 会帮你改动已有的表（它不会，schema 会静默漂移）。
+ */
+export const SCHEMA_VERSION = 1;
+
 export const SCHEMA_SQL = `-- miao-workflow (@catease/workflow) —— PostgreSQL schema
 --
 -- 五张表。没有 Redis，没有独立 scheduler，没有消息队列。
@@ -17,6 +26,12 @@ export const SCHEMA_SQL = `-- miao-workflow (@catease/workflow) —— PostgreSQ
 -- （definition / input / context / output / patch / payload / error）。
 --
 -- 注意：表名不做 schema 限定，走连接的 search_path。
+
+-- 迁移记录：migrate() 每次都会把当前版本写进来（幂等）
+CREATE TABLE IF NOT EXISTS workflow_schema_migrations (
+    version    integer     PRIMARY KEY,
+    applied_at timestamptz NOT NULL DEFAULT now()
+);
 
 CREATE TABLE IF NOT EXISTS workflow_definitions (
     workflow_id     text        NOT NULL,
@@ -84,7 +99,9 @@ CREATE TABLE IF NOT EXISTS workflow_step_runs (
     status          text        NOT NULL
         CHECK (status IN ('PENDING','RUNNING','WAITING','RETRYING','COMPLETED','FAILED','UNKNOWN')),
 
+    -- attempt = 尝试次数（审计，含等待唤醒）；failures = 真正失败次数（重试判定用）
     attempt         integer     NOT NULL DEFAULT 1 CHECK (attempt >= 1),
+    failures        integer     NOT NULL DEFAULT 0 CHECK (failures >= 0),
     visit           integer     NOT NULL DEFAULT 1 CHECK (visit >= 1),
 
     input           jsonb,
@@ -94,6 +111,8 @@ CREATE TABLE IF NOT EXISTS workflow_step_runs (
     error           jsonb,
 
     wait_for        text,
+    -- 这次等待的信号水位线：seq <= 它的信号算「等待之前来的」，不予消费
+    wait_since_seq  bigint,
     wait_payload    jsonb,
 
     idempotency_key text        NOT NULL UNIQUE,
@@ -117,6 +136,8 @@ CREATE TABLE IF NOT EXISTS workflow_signals (
     seq         bigint      GENERATED ALWAYS AS IDENTITY,
     run_id      text        NOT NULL REFERENCES workflow_runs (id) ON DELETE CASCADE,
     name        text        NOT NULL,
+    -- 定向到某个 step；NULL = 未定向（按「等待开始之后」的时间窗匹配）
+    step_id     text,
     payload     jsonb,
     created_at  timestamptz NOT NULL DEFAULT now(),
     consumed_at timestamptz
@@ -162,6 +183,7 @@ export const CLAIM_DUE_SQL = `WITH due AS (
              -- 挂起中：时间到点（delay / 等待超时），或者有匹配的未消费信号（人类点了 Approve）
           OR (status = 'WAITING' AND (
                    (wake_at IS NOT NULL AND wake_at <= $2::timestamptz)
+                -- 有「对这次等待可用」的信号才可抢（规则见 CONSUME_SIGNAL_SQL）
                 OR EXISTS (
                      SELECT 1
                        FROM workflow_signals s
@@ -170,6 +192,10 @@ export const CLAIM_DUE_SQL = `WITH due AS (
                         AND sr.wait_for IS NOT NULL
                         AND s.name = sr.wait_for
                         AND s.consumed_at IS NULL
+                        AND (
+                              (s.step_id IS NOT NULL AND s.step_id = sr.step_id)
+                           OR (s.step_id IS NULL AND s.seq > COALESCE(sr.wait_since_seq, 0))
+                        )
                    )
              ))
        )
@@ -185,15 +211,29 @@ UPDATE workflow_runs r
  WHERE r.id = due.id
 RETURNING r.*`;
 
-/** 消费一条信号：原子地挑出最老的一条未消费信号并打上 consumed_at。 */
+/**
+ * 消费一条信号：原子地挑出最老的一条**对这次等待可用**的信号并打上 consumed_at。
+ *
+ * 可用性规则（与 memory 实现的 isSignalEligible 必须完全一致）：
+ * - 名字一致
+ * - 定向信号：step 对上即可（发送者明确说了给谁）
+ * - 未定向信号：必须**在这次等待登记之后入队**（$4 = 等待开始时的信号水位线）
+ *
+ * 未定向且到得太早的信号会被留在队列里 —— 它可能是给别的 gate 的，
+ * 猜着消费会造成「没人批准过，却过了」。
+ */
 export const CONSUME_SIGNAL_SQL = `UPDATE workflow_signals
-    SET consumed_at = $3::timestamptz
+    SET consumed_at = $5::timestamptz
   WHERE id = (
         SELECT id
           FROM workflow_signals
          WHERE run_id = $1
            AND name = $2
            AND consumed_at IS NULL
+           AND (
+                 (step_id IS NOT NULL AND step_id = $3)
+              OR (step_id IS NULL AND seq > $4)
+           )
          ORDER BY created_at, seq
          LIMIT 1
          FOR UPDATE SKIP LOCKED

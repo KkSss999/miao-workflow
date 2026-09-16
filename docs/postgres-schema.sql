@@ -8,6 +8,12 @@
 --
 -- 注意：表名不做 schema 限定，走连接的 search_path。
 
+-- 迁移记录：migrate() 每次都会把当前版本写进来（幂等）
+CREATE TABLE IF NOT EXISTS workflow_schema_migrations (
+    version    integer     PRIMARY KEY,
+    applied_at timestamptz NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS workflow_definitions (
     workflow_id     text        NOT NULL,
     version         integer     NOT NULL CHECK (version >= 1),
@@ -74,7 +80,9 @@ CREATE TABLE IF NOT EXISTS workflow_step_runs (
     status          text        NOT NULL
         CHECK (status IN ('PENDING','RUNNING','WAITING','RETRYING','COMPLETED','FAILED','UNKNOWN')),
 
+    -- attempt = 尝试次数（审计，含等待唤醒）；failures = 真正失败次数（重试判定用）
     attempt         integer     NOT NULL DEFAULT 1 CHECK (attempt >= 1),
+    failures        integer     NOT NULL DEFAULT 0 CHECK (failures >= 0),
     visit           integer     NOT NULL DEFAULT 1 CHECK (visit >= 1),
 
     input           jsonb,
@@ -84,6 +92,8 @@ CREATE TABLE IF NOT EXISTS workflow_step_runs (
     error           jsonb,
 
     wait_for        text,
+    -- 这次等待的信号水位线：seq <= 它的信号算「等待之前来的」，不予消费
+    wait_since_seq  bigint,
     wait_payload    jsonb,
 
     idempotency_key text        NOT NULL UNIQUE,
@@ -107,6 +117,8 @@ CREATE TABLE IF NOT EXISTS workflow_signals (
     seq         bigint      GENERATED ALWAYS AS IDENTITY,
     run_id      text        NOT NULL REFERENCES workflow_runs (id) ON DELETE CASCADE,
     name        text        NOT NULL,
+    -- 定向到某个 step；NULL = 未定向（按「等待开始之后」的时间窗匹配）
+    step_id     text,
     payload     jsonb,
     created_at  timestamptz NOT NULL DEFAULT now(),
     consumed_at timestamptz

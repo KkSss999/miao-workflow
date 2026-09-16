@@ -48,6 +48,25 @@
 - 新增公开 API 必须同时从 `src/index.ts` 导出，并在 README 状态表里更新状态。
 - 内部实现细节不进 `src/index.ts`。
 
+## Review 之后新增的约定（2026-09，别改回去）
+
+1. **信号的可用性看序列号，不看时间戳。** `WorkflowSignal.seq`（storage 分配）+
+   `StepRun.waitSinceSeq`（等待登记时的水位线）。规则：定向看 step，未定向看 `seq > waitSinceSeq`。
+   `engine.signal` 的定向投递用 `options.stepId`。
+   **不要**为了「不丢信号」把它改回「按名字就消费」—— 那正是 gate 冒领的 bug。
+2. **心跳里的异常必须被吞掉并上报**（`LeaseManager.startHeartbeat` 的 onError/onLost）。
+   漏一个 rejection 出去，Node 默认直接杀进程 —— 而心跳的意义就是「数据库抖一下无所谓」。
+3. **`attempt` 是审计（含等待唤醒），`failures` 才用于重试判定。** 别再用 attempt 算重试预算。
+4. **非终态 run 的 `currentStepId === null` 必须报错**，绝不能 fallback 到 `definition.start`
+   （那是静默回滚整个工作流 = 重复副作用）。
+5. **落库/校验阶段的异常也要变成一条 FAILED 记录**（`StepRunner.#persistFailure`），
+   不许逃出引擎 —— 否则 run 卡在 RUNNING 且审计里什么都没有。
+6. **游标不存在 = 报错**（两个适配器一致）。默默返回全部/返回空都是事故。
+7. **`engine.tick` 的所有出口都要释放 lease**（try/finally），不要只修某一条路径。
+8. **`limits` 必须校验**（`maxStepsPerTick >= 1`），0 会让 run 永远推不动而 worker 空转。
+9. **schema 变更要写迁移**：`SCHEMA_SQL` 是全量 DDL，`CREATE TABLE IF NOT EXISTS` 不会改动已有的表；
+   `SCHEMA_VERSION` + `workflow_schema_migrations` 是版本锚点。
+
 ## 命令
 
 ```bash
@@ -70,6 +89,8 @@ pnpm build      # tsc → dist/
 - `src/storage/*`：interface · memory · postgres · schema（DDL 权威来源）
 - `src/worker/*`：worker · lease · scheduler
 - `src/extensions/wasm/*`：WASM handler 宿主（子路径 `@catease/workflow/wasm`）
+
+未修的已知问题都在 `docs/backlog.md`（有做法，不是「以后再说」）。
 
 ## 框架规矩（用测试钉住的，不要破）
 
@@ -131,6 +152,25 @@ pnpm build      # tsc → dist/
    两边不一致 = conformance 白写。
 7. **顺序 = 插入顺序**：三张表用自增 `seq`，查询 `ORDER BY seq`；**绝不用随机 id 做 tiebreak**。
 8. **没有 `MWF_TEST_POSTGRES_URL` 就跳过**，不要假装测过；`pnpm test:postgres` 拉临时容器。
+
+## Review 之后新增的约定（2026-09，别改回去）
+
+1. **信号的可用性看序列号，不看时间戳。** `WorkflowSignal.seq`（storage 分配）+
+   `StepRun.waitSinceSeq`（等待登记时的水位线）。规则：定向看 step，未定向看 `seq > waitSinceSeq`。
+   `engine.signal` 的定向投递用 `options.stepId`。
+   **不要**为了「不丢信号」把它改回「按名字就消费」—— 那正是 gate 冒领的 bug。
+2. **心跳里的异常必须被吞掉并上报**（`LeaseManager.startHeartbeat` 的 onError/onLost）。
+   漏一个 rejection 出去，Node 默认直接杀进程 —— 而心跳的意义就是「数据库抖一下无所谓」。
+3. **`attempt` 是审计（含等待唤醒），`failures` 才用于重试判定。** 别再用 attempt 算重试预算。
+4. **非终态 run 的 `currentStepId === null` 必须报错**，绝不能 fallback 到 `definition.start`
+   （那是静默回滚整个工作流 = 重复副作用）。
+5. **落库/校验阶段的异常也要变成一条 FAILED 记录**（`StepRunner.#persistFailure`），
+   不许逃出引擎 —— 否则 run 卡在 RUNNING 且审计里什么都没有。
+6. **游标不存在 = 报错**（两个适配器一致）。默默返回全部/返回空都是事故。
+7. **`engine.tick` 的所有出口都要释放 lease**（try/finally），不要只修某一条路径。
+8. **`limits` 必须校验**（`maxStepsPerTick >= 1`），0 会让 run 永远推不动而 worker 空转。
+9. **schema 变更要写迁移**：`SCHEMA_SQL` 是全量 DDL，`CREATE TABLE IF NOT EXISTS` 不会改动已有的表；
+   `SCHEMA_VERSION` + `workflow_schema_migrations` 是版本锚点。
 
 ## 命令
 

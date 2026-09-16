@@ -82,6 +82,7 @@ mwf_execute 返回 respPtr，内存里是：
 | 响应不是合法 JSON / status 不合法 | 执行失败（`wasm.response`） |
 | 模块 trap（`unreachable` 等） | 执行失败（`wasm.trap`），`retryable: false` |
 | 执行超过 `maxDurationMs` / `timeoutMs` / `step.timeoutMs` | inline 模式：事后审计（`wasm.overrun`）；**worker 模式：terminate 掉线程** |
+| 线性内存超过 `maxMemoryBytes` | 执行失败（`wasm.bounds`）—— **事后检查**：`memory.grow` 拦不住，硬隔离要独立进程 |
 
 失败一律包成 `WasmHostError extends WorkflowError`（code `STEP_FAILED`，`retryable: false`），
 所以它进 step run 的 `error` 字段、进事件流、被 UI 显示的方式和普通 handler 完全一样。

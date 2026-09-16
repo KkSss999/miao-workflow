@@ -1,4 +1,4 @@
-import { StorageConflictError } from "../core/errors.js";
+import { StorageConflictError, ValidationError } from "../core/errors.js";
 import type { SerializedWorkflowError } from "../core/errors.js";
 import type { WorkflowDefinition } from "../definition/workflow.js";
 import type { StepId } from "../definition/step.js";
@@ -9,6 +9,7 @@ import type { WorkflowSignal } from "../runtime/signal.js";
 import type { StepRun, StepRunPatch, StepStatus } from "../runtime/step-run.js";
 import type {
   ClaimOptions,
+  ConsumeSignalInput,
   DefinitionRecord,
   DefinitionStore,
   EventStore,
@@ -17,7 +18,7 @@ import type {
   StepRunStore,
   WorkflowStorage,
 } from "./interface.js";
-import { CLAIM_DUE_SQL, CONSUME_SIGNAL_SQL, SCHEMA_SQL } from "./schema.js";
+import { CLAIM_DUE_SQL, CONSUME_SIGNAL_SQL, SCHEMA_SQL, SCHEMA_VERSION } from "./schema.js";
 
 /**
  * 最小 SQL 客户端形状。
@@ -83,9 +84,26 @@ export class PostgresWorkflowStorage implements WorkflowStorage {
     this.events = new PostgresEventStore(this);
   }
 
-  /** 幂等建表（全部 CREATE ... IF NOT EXISTS）。 */
+  /**
+   * 幂等建表 + 记录 schema 版本。
+   *
+   * 注意：`SCHEMA_SQL` 是全量 DDL，`CREATE TABLE IF NOT EXISTS` **不会**改动已存在的表。
+   * 以后加列必须写显式迁移（见 `SCHEMA_VERSION` 的注释）。
+   */
   async migrate(): Promise<void> {
     await this.client.query(SCHEMA_SQL);
+    await this.client.query(
+      `INSERT INTO workflow_schema_migrations (version) VALUES ($1) ON CONFLICT (version) DO NOTHING`,
+      [SCHEMA_VERSION],
+    );
+  }
+
+  /** 已应用的最高 schema 版本（还没 migrate 过就是 0）。 */
+  async schemaVersion(): Promise<number> {
+    const result = await this.client.query<{ version: number | null }>(
+      `SELECT max(version) AS version FROM workflow_schema_migrations`,
+    );
+    return Number(result.rows[0]?.version ?? 0);
   }
 }
 
@@ -115,8 +133,10 @@ interface StepRunRow {
   id: string;
   run_id: string;
   step_id: string;
+  wait_since_seq: string | number | null;
   status: string;
   attempt: number;
+  failures: number;
   visit: number;
   input: JsonValue | null;
   output: JsonValue | null;
@@ -144,6 +164,8 @@ interface SignalRow {
   id: string;
   run_id: string;
   name: string;
+  seq: string | number;
+  step_id: string | null;
   payload: JsonValue | null;
   created_at: Timestamp;
   consumed_at: Timestamp;
@@ -202,12 +224,14 @@ function toStepRun(row: StepRunRow): StepRun {
     stepId: row.step_id,
     status: row.status as StepStatus,
     attempt: row.attempt,
+    failures: row.failures,
     visit: row.visit,
     input: row.input ?? undefined,
     output: row.output ?? undefined,
     patch: row.patch ?? undefined,
     error: row.error,
     waitFor: row.wait_for,
+    waitSinceSeq: row.wait_since_seq === null ? null : Number(row.wait_since_seq),
     idempotencyKey: row.idempotency_key,
     startedAt: toIso(row.started_at),
     finishedAt: toIso(row.finished_at),
@@ -224,6 +248,8 @@ function toSignal(row: SignalRow): WorkflowSignal {
     id: row.id,
     runId: row.run_id,
     name: row.name,
+    seq: Number(row.seq),
+    stepId: row.step_id,
     payload: row.payload ?? undefined,
     createdAt: requireIso(row.created_at),
     consumedAt: toIso(row.consumed_at),
@@ -261,6 +287,8 @@ const RUN_COLUMNS = {
 const STEP_RUN_COLUMNS = {
   status: "status",
   attempt: "attempt",
+  failures: "failures",
+  waitSinceSeq: "wait_since_seq",
   visit: "visit",
   input: "input",
   output: "output",
@@ -484,13 +512,13 @@ class PostgresStepRunStore implements StepRunStore {
   async create(stepRun: StepRun): Promise<void> {
     await this.storage.client.query(
       `INSERT INTO workflow_step_runs (
-         id, run_id, step_id, status, attempt, visit,
-         input, output, patch, error, wait_for, wait_payload,
+         id, run_id, step_id, status, attempt, failures, visit,
+         input, output, patch, error, wait_for, wait_since_seq, wait_payload,
          idempotency_key, started_at, finished_at, wake_at, created_at, updated_at
        ) VALUES (
-         $1, $2, $3, $4, $5, $6,
-         $7::jsonb, $8::jsonb, $9::jsonb, $10::jsonb, $11, $12::jsonb,
-         $13, $14::timestamptz, $15::timestamptz, $16::timestamptz, $17::timestamptz, $18::timestamptz
+         $1, $2, $3, $4, $5, $6, $7,
+         $8::jsonb, $9::jsonb, $10::jsonb, $11::jsonb, $12, $13,
+         $14::jsonb, $15, $16::timestamptz, $17::timestamptz, $18::timestamptz, $19::timestamptz, $20::timestamptz
        )`,
       [
         stepRun.id,
@@ -498,12 +526,14 @@ class PostgresStepRunStore implements StepRunStore {
         stepRun.stepId,
         stepRun.status,
         stepRun.attempt,
+        stepRun.failures,
         stepRun.visit,
         JSON.stringify(value(stepRun.input)),
         JSON.stringify(value(stepRun.output)),
         JSON.stringify(value(stepRun.patch)),
         stepRun.error === null ? null : JSON.stringify(stepRun.error),
         stepRun.waitFor,
+        stepRun.waitSinceSeq,
         JSON.stringify(value(stepRun.waitPayload)),
         stepRun.idempotencyKey,
         stepRun.startedAt,
@@ -594,24 +624,46 @@ class PostgresStepRunStore implements StepRunStore {
 class PostgresSignalStore implements SignalStore {
   constructor(readonly storage: PostgresWorkflowStorage) {}
 
-  async append(signal: WorkflowSignal): Promise<void> {
-    await this.storage.client.query(
-      `INSERT INTO workflow_signals (id, run_id, name, payload, created_at, consumed_at)
-       VALUES ($1, $2, $3, $4::jsonb, $5::timestamptz, $6::timestamptz)`,
+  async append(signal: Omit<WorkflowSignal, "seq">): Promise<WorkflowSignal> {
+    // seq 由 identity 列分配，调用方传什么都不算
+    const result = await this.storage.client.query<SignalRow>(
+      `INSERT INTO workflow_signals (id, run_id, name, step_id, payload, created_at, consumed_at)
+       VALUES ($1, $2, $3, $4, $5::jsonb, $6::timestamptz, $7::timestamptz)
+       RETURNING *`,
       [
         signal.id,
         signal.runId,
         signal.name,
+        signal.stepId,
         JSON.stringify(value(signal.payload)),
         signal.createdAt,
         signal.consumedAt,
       ],
     );
+    const row = result.rows[0];
+    if (row === undefined) {
+      throw new StorageConflictError(`signal "${signal.id}" 写入失败（没有返回行）`, { signalId: signal.id });
+    }
+    return toSignal(row);
   }
 
-  async consumeNext(runId: string, name: string, now?: string): Promise<WorkflowSignal | null> {
-    const at = now ?? this.storage.now().toISOString();
-    const result = await this.storage.client.query<SignalRow>(CONSUME_SIGNAL_SQL, [runId, name, at]);
+  async watermark(runId: string): Promise<number> {
+    const result = await this.storage.client.query<{ max: string | null }>(
+      `SELECT max(seq)::text AS max FROM workflow_signals WHERE run_id = $1`,
+      [runId],
+    );
+    return Number(result.rows[0]?.max ?? 0);
+  }
+
+  async consumeNext(input: ConsumeSignalInput): Promise<WorkflowSignal | null> {
+    const at = input.now ?? this.storage.now().toISOString();
+    const result = await this.storage.client.query<SignalRow>(CONSUME_SIGNAL_SQL, [
+      input.runId,
+      input.name,
+      input.stepId,
+      input.sinceSeq,
+      at,
+    ]);
     const row = result.rows[0];
     return row === undefined ? null : toSignal(row);
   }
@@ -645,6 +697,20 @@ class PostgresEventStore implements EventStore {
   }
 
   async listByRun(runId: string, options: { limit?: number; after?: string } = {}): Promise<WorkflowEvent[]> {
+    if (options.after !== undefined) {
+      // 游标不存在时子查询会是 NULL，SQL 会「安静地返回空」——
+      // 那和内存实现（返回全部 / 报错）就是两种语义了，所以显式检查一次。
+      const cursor = await this.storage.client.query<{ id: string }>(
+        `SELECT id FROM workflow_events WHERE id = $1 AND run_id = $2`,
+        [options.after, runId],
+      );
+      if (cursor.rows[0] === undefined) {
+        throw new ValidationError(`事件游标 "${options.after}" 不存在（run ${runId}）`, {
+          details: { runId, after: options.after },
+        });
+      }
+    }
+
     const result = await this.storage.client.query<EventRow>(
       `SELECT * FROM workflow_events
         WHERE run_id = $1

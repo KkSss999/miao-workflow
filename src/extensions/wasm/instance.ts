@@ -32,6 +32,14 @@ export interface WasmModuleOptions {
   maxResponseBytes?: number;
   /** 事后审计用：执行超过这个时长就标记失败（同步 wasm 无法被中断，见 docs/wasm-abi.md） */
   maxDurationMs?: number;
+  /**
+   * 模块线性内存的上限（字节）。超过就判定失败。
+   *
+   * 同步 wasm 里宿主**拦不住** `memory.grow`，所以这是事后检查 ——
+   * 但它至少能把「模块偷偷长到几 GB」变成一个显式的失败，而不是 OOM。
+   * 真要硬隔离，用 `execution: "worker"` 并给进程设内存上限。
+   */
+  maxMemoryBytes?: number;
 }
 
 /** 模块导出的形状（加载时校验，运行时直接用） */
@@ -56,6 +64,7 @@ export class WasmStepModule implements WasmStepInvoker {
   readonly name: string;
   readonly maxResponseBytes: number;
   readonly maxDurationMs: number | undefined;
+  readonly maxMemoryBytes: number | undefined;
 
   readonly #exports: RequiredExports;
   readonly #memory: WasmMemoryLike;
@@ -64,6 +73,7 @@ export class WasmStepModule implements WasmStepInvoker {
     this.name = options.name ?? "wasm-step";
     this.maxResponseBytes = options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES;
     this.maxDurationMs = options.maxDurationMs;
+    this.maxMemoryBytes = options.maxMemoryBytes;
 
     const runtime = wasmRuntime();
     const bytes = toModuleBytes(source);
@@ -169,6 +179,13 @@ export class WasmStepModule implements WasmStepInvoker {
       });
     } finally {
       this.#exports.mwf_free?.(requestPtr, payload.byteLength);
+    }
+
+    if (this.maxMemoryBytes !== undefined && this.#memory.buffer.byteLength > this.maxMemoryBytes) {
+      throw new WasmHostError(
+        `wasm 模块 "${this.name}" 把内存涨到了 ${this.#memory.buffer.byteLength} 字节，超过上限 ${this.maxMemoryBytes}`,
+        { kind: "wasm.bounds", moduleName: this.name },
+      );
     }
 
     const elapsed = Date.now() - startedAt;

@@ -175,7 +175,88 @@ export class StepRunner {
       result = { status: "failed", error: timeoutError(stepId, step) };
     }
 
-    return this.#persist({ run, stepId, step, existing, stepRunId, idempotencyKey, attempt, visit, input, startedAt, result });
+    try {
+      return await this.#persist({
+        run,
+        stepId,
+        step,
+        existing,
+        stepRunId,
+        idempotencyKey,
+        attempt,
+        visit,
+        input,
+        startedAt,
+        result,
+      });
+    } catch (error) {
+      // 落库 / 校验阶段的任何异常都不许逃出引擎：它必须变成一条可审计的失败记录，
+      // 否则 run 会卡在 RUNNING 且没有任何痕迹（静默活锁）。
+      return this.#persistFailure(
+        { run, stepId, step, existing, stepRunId, idempotencyKey, attempt, visit, input, startedAt },
+        error,
+      );
+    }
+  }
+
+  /** 连「写失败记录」都失败时才会抛出去 —— 那种情况存储已经不可用了。 */
+  async #persistFailure(
+    args: {
+      run: WorkflowRun;
+      stepId: StepId;
+      step: StepDefinition;
+      existing: StepRun | null;
+      stepRunId: string;
+      idempotencyKey: string;
+      attempt: number;
+      visit: number;
+      input: JsonValue | undefined;
+      startedAt: IsoTimestamp;
+    },
+    cause: unknown,
+  ): Promise<StepExecutionOutcome> {
+    const { run, stepId, step, existing, stepRunId, idempotencyKey, attempt, visit, input, startedAt } = args;
+    const error = serializeError(
+      toWorkflowError(cause, { code: "VALIDATION_ERROR", message: `step "${step.uses}" 的结果无法落库` }),
+    );
+    const finishedAt = (this.options.now?.() ?? new Date()).toISOString();
+    const fields = {
+      status: "FAILED" as const,
+      attempt,
+      failures: (existing?.failures ?? 0) + 1,
+      visit,
+      input,
+      output: undefined,
+      patch: undefined,
+      error,
+      waitFor: existing?.waitFor ?? null,
+      waitSinceSeq: existing?.waitSinceSeq ?? null,
+      wakeAt: existing?.wakeAt ?? null,
+      startedAt,
+      finishedAt,
+    };
+
+    if (existing === null) {
+      const created: StepRun = {
+        id: stepRunId,
+        runId: run.id,
+        stepId,
+        idempotencyKey,
+        createdAt: startedAt,
+        updatedAt: finishedAt,
+        ...fields,
+      };
+      await this.options.storage.steps.create(created);
+      return { stepRun: created, status: "FAILED", output: undefined, patch: undefined };
+    }
+
+    await this.options.storage.steps.update(stepRunId, fields);
+    return {
+      stepRun: { ...existing, ...fields, updatedAt: finishedAt },
+      status: "FAILED",
+      output: undefined,
+      patch: undefined,
+    };
   }
 
   async #persist(args: {
@@ -194,12 +275,14 @@ export class StepRunner {
     const { run, stepId, step, existing, stepRunId, idempotencyKey, attempt, visit, input, startedAt, result } = args;
 
     let status: StepStatus;
+    let failures = existing?.failures ?? 0;
     let output: JsonValue | undefined;
     let patch: JsonObject | undefined;
     let error: SerializedWorkflowError | null = null;
     // 挂起信息要在失败/成功之后**保留**：被信号叫醒的那次尝试如果失败了，
     // 重试时不能再要一次信号 —— 外部世界不会自己再来一遍。
     let waitFor: string | null = existing?.waitFor ?? null;
+    let waitSinceSeq: number | null = existing?.waitSinceSeq ?? null;
     let wakeAt: IsoTimestamp | null = existing?.wakeAt ?? null;
 
     if (result.status === "completed") {
@@ -221,22 +304,27 @@ export class StepRunner {
       status = "WAITING";
       waitFor = result.waitFor;
       wakeAt = result.wakeAt ?? null;
+      // 水位线：此刻队列里已有多少条信号。之后到达的才允许唤醒这次等待。
+      waitSinceSeq = await this.options.storage.signals.watermark(run.id);
     } else {
       error = serializeError(result.error);
       // UNKNOWN 必须是一等状态：外部可能已经成功，自动重试会造成重复副作用
       status = result.error.code === "UNKNOWN_OUTCOME" ? "UNKNOWN" : "FAILED";
+      failures += 1;
     }
 
     const finishedAt = (this.options.now?.() ?? new Date()).toISOString();
     const fields = {
       status,
       attempt,
+      failures,
       visit,
       input,
       output,
       patch,
       error,
       waitFor,
+      waitSinceSeq,
       wakeAt,
       startedAt,
       finishedAt,

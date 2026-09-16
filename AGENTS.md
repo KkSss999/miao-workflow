@@ -67,6 +67,18 @@
 9. **schema 变更要写迁移**：`SCHEMA_SQL` 是全量 DDL，`CREATE TABLE IF NOT EXISTS` 不会改动已有的表；
    `SCHEMA_VERSION` + `workflow_schema_migrations` 是版本锚点。
 
+## 性能 / 保留策略相关的约定
+
+1. **缓存依赖「发布即不可变」。** `#publishedHashes` 与 `#definitions` 两张表都建立在这条不变量上；
+   如果哪天允许改已发布的 definition，这两处缓存必须先删。
+2. **tick 内的 step run 历史只读一次。** 之后全靠 `upsert(history, stepRun)` 增量维护 ——
+   新增写 step run 的地方**必须**同步本地历史，否则会出现「读到的状态比库里旧」。
+3. **`prune` 只删终态 run**（COMPLETED / FAILED / CANCELLED 且 completedAt < before）。
+   绝不能让它碰到 RUNNING / WAITING —— 那可能正被别的 worker 处理。
+4. **`WorkerTickResult`：`handled` 是「没抛错」，`completed` 才是「落到终态」。** 别把 handled 当成功。
+5. **每步一次的 `renewLease` 是有意保留的**（归属一致性检查，按主键的 UPDATE）。
+   想省往返请先做批写，不要拿「发现 lease 被抢」的窗口去换。
+
 ## 命令
 
 ```bash
@@ -171,6 +183,18 @@ pnpm build      # tsc → dist/
 8. **`limits` 必须校验**（`maxStepsPerTick >= 1`），0 会让 run 永远推不动而 worker 空转。
 9. **schema 变更要写迁移**：`SCHEMA_SQL` 是全量 DDL，`CREATE TABLE IF NOT EXISTS` 不会改动已有的表；
    `SCHEMA_VERSION` + `workflow_schema_migrations` 是版本锚点。
+
+## 性能 / 保留策略相关的约定
+
+1. **缓存依赖「发布即不可变」。** `#publishedHashes` 与 `#definitions` 两张表都建立在这条不变量上；
+   如果哪天允许改已发布的 definition，这两处缓存必须先删。
+2. **tick 内的 step run 历史只读一次。** 之后全靠 `upsert(history, stepRun)` 增量维护 ——
+   新增写 step run 的地方**必须**同步本地历史，否则会出现「读到的状态比库里旧」。
+3. **`prune` 只删终态 run**（COMPLETED / FAILED / CANCELLED 且 completedAt < before）。
+   绝不能让它碰到 RUNNING / WAITING —— 那可能正被别的 worker 处理。
+4. **`WorkerTickResult`：`handled` 是「没抛错」，`completed` 才是「落到终态」。** 别把 handled 当成功。
+5. **每步一次的 `renewLease` 是有意保留的**（归属一致性检查，按主键的 UPDATE）。
+   想省往返请先做批写，不要拿「发现 lease 被抢」的窗口去换。
 
 ## 命令
 

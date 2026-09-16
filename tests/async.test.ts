@@ -53,7 +53,7 @@ describe("Phase D: signal / wait / resume", () => {
 
     // 挂起中的 run 现在可抢了（因为有一条匹配的未消费信号）
     const result = await h.worker.tick();
-    expect(result).toEqual({ claimed: 1, processed: 1, failed: 0 });
+    expect(result).toEqual({ claimed: 1, handled: 1, failed: 0, completed: 1 });
 
     const final = await h.engine.get(run.id);
     expect(final.status).toBe("COMPLETED");

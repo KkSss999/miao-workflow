@@ -146,8 +146,6 @@ export {
   TERMINAL_STEP_STATUSES,
   buildIdempotencyKey,
   isTerminalStepStatus,
-  serializeStepError,
-  stepRunError,
 } from "./runtime/step-run.js";
 export type { StepRun, StepRunPatch, StepStatus } from "./runtime/step-run.js";
 
@@ -155,12 +153,7 @@ export { isSignalEligible } from "./runtime/signal.js";
 export type { SignalOptions, WorkflowSignal } from "./runtime/signal.js";
 export type { WorkflowEvent, WorkflowEventType } from "./runtime/events.js";
 
-export {
-  RESERVED_HANDLERS as BUILTIN_HANDLERS,
-  createCompleteHandler,
-  createDelayHandler,
-  parseDuration,
-} from "./runtime/builtins.js";
+export { createCompleteHandler, createDelayHandler, parseDuration } from "./runtime/builtins.js";
 export type { DelayConfig, StepResume } from "./runtime/builtins.js";
 
 export {

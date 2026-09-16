@@ -137,7 +137,7 @@ describe("Phase F: 作为 StepHandler 跑在 engine 里", () => {
       { input: { text: "报价 1200 CNY" } },
     );
 
-    expect(await h.worker.tick()).toEqual({ claimed: 1, processed: 1, failed: 0 });
+    expect(await h.worker.tick()).toEqual({ claimed: 1, handled: 1, failed: 0, completed: 1 });
     expect((await h.engine.get(run.id)).status).toBe("COMPLETED");
     expect(h.calls).toEqual(["after"]);
 
@@ -192,7 +192,7 @@ describe("Phase F: 作为 StepHandler 跑在 engine 里", () => {
       }),
     );
 
-    expect((await h.worker.tick()).processed).toBe(1);
+    expect((await h.worker.tick()).handled).toBe(1);
     const retrying = await h.engine.get(run.id);
     expect(retrying.status).toBe("RETRYING");
     expect(retrying.wakeAt).toBe("2026-01-01T00:00:01.000Z");

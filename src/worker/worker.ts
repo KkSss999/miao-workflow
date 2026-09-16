@@ -3,6 +3,7 @@ import { hostname } from "node:os";
 
 import type { WorkflowEngine } from "../core/engine.js";
 import { LeaseLostError } from "../core/errors.js";
+import { isTerminalRunStatus } from "../runtime/run.js";
 import { DEFAULT_LEASE_MS, DEFAULT_LEASE_RENEW_INTERVAL_MS, LeaseManager } from "./lease.js";
 import { DEFAULT_POLL_INTERVAL_MS, DEFAULT_POLL_JITTER_MS, Scheduler } from "./scheduler.js";
 
@@ -27,10 +28,12 @@ export interface WorkflowWorkerOptions {
 export interface WorkerTickResult {
   /** 抢到几个 run */
   claimed: number;
-  /** 有几个正常处理完（不代表 run 已终态） */
-  processed: number;
+  /** 有几个「引擎没抛错地处理完」（**不等于成功**：handler 失败也算 handled） */
+  handled: number;
   /** 有几个处理时抛错（已经被隔离，不影响别的 run） */
   failed: number;
+  /** 经过这次 tick 之后落到终态（COMPLETED / FAILED / CANCELLED）的 run 数 */
+  completed: number;
 }
 
 /**
@@ -113,17 +116,18 @@ export class WorkflowWorker {
    */
   async tick(): Promise<WorkerTickResult> {
     const claimed = await this.lease.claim(this.concurrency);
-    if (claimed.length === 0) return { claimed: 0, processed: 0, failed: 0 };
+    if (claimed.length === 0) return { claimed: 0, handled: 0, failed: 0, completed: 0 };
 
     const outcomes = await Promise.all(claimed.map((run) => this.#process(run.id)));
     return {
       claimed: claimed.length,
-      processed: outcomes.filter((outcome) => outcome === "processed").length,
-      failed: outcomes.filter((outcome) => outcome === "failed").length,
+      handled: outcomes.filter((outcome) => outcome.outcome === "handled").length,
+      failed: outcomes.filter((outcome) => outcome.outcome === "failed").length,
+      completed: outcomes.filter((outcome) => outcome.completed).length,
     };
   }
 
-  async #process(runId: string): Promise<"processed" | "failed"> {
+  async #process(runId: string): Promise<{ outcome: "handled" | "failed"; completed: boolean }> {
     // 心跳：handler 可能跑很久（也可能卡住），不能让 lease 在中途过期
     const stopHeartbeat = this.lease.startHeartbeat(runId, {
       onLost: () => this.#onError(new LeaseLostError(runId), { runId }),
@@ -131,26 +135,28 @@ export class WorkflowWorker {
       onError: (error) => this.#onError(error, { runId }),
     });
 
-    const task = (async (): Promise<"processed" | "failed"> => {
+    const task = async (): Promise<{ outcome: "handled" | "failed"; completed: boolean }> => {
       try {
-        await this.engine.tick(runId, { owner: this.owner, leaseMs: this.lease.leaseMs });
-        return "processed";
+        const result = await this.engine.tick(runId, { owner: this.owner, leaseMs: this.lease.leaseMs });
+        // status 是这次 tick 之后 run 的状态 —— 直接用它判断有没有终态，不用额外查库
+        return { outcome: "handled", completed: isTerminalRunStatus(result.status) };
       } catch (error) {
         // 失败隔离：一个坏 handler 不该把整批 run 拖下水
         this.#onError(error, { runId });
-        return "failed";
+        return { outcome: "failed", completed: false };
       } finally {
         stopHeartbeat();
         // 主动放手：下一轮（或别的 worker）能立刻接着推进
         await this.lease.release(runId).catch(() => undefined);
       }
-    })();
+    };
 
-    this.#inFlight.add(task);
+    const pending = task();
+    this.#inFlight.add(pending);
     try {
-      return await task;
+      return await pending;
     } finally {
-      this.#inFlight.delete(task);
+      this.#inFlight.delete(pending);
     }
   }
 }

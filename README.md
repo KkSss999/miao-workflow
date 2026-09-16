@@ -98,6 +98,16 @@ Core 只知道 `Workflow · Run · Step · Transition · Handler · Signal · Re
 
 人审批可以等三天、delay 可以等两周 —— **等待期间不占进程、不挂 Promise，进程随便 kill -9**。
 
+出了事也救得回来：
+
+```ts
+// 下游修好了 → 人工重试（同一条 step run、同一个幂等键，下游才能去重）
+await client.reconcile(runId, "retry");
+
+// 审计数据定期清理（只删终态，不碰正在跑的）
+await engine.prune({ before: new Date(Date.now() - 30 * 86_400_000).toISOString() });
+```
+
 | 模块 | 状态 | Phase |
 |---|---|---|
 | JSON definition + 归一化 | ✅ 实现 | — |
@@ -118,7 +128,8 @@ Core 只知道 `Workflow · Run · Step · Transition · Handler · Signal · Re
 | Storage conformance：Memory 与 Postgres 同一套断言 | ✅ 实现 | B |
 | `WorkflowWorker`（抢占 · 心跳 · drain） | ✅ 实现 | C |
 | signal / wait / resume / `workflow.delay` / cancel | ✅ 实现 | D |
-| `engine.reconcile`（UNKNOWN 的人工入口） | ✅ 实现 | C |
+| `engine.reconcile`（FAILED / UNKNOWN 的人工入口） | ✅ 实现 | C |
+| `engine.prune`（保留策略：只删终态旧 run） | ✅ 实现 | — |
 | WASM handler 宿主（`@catease/workflow/wasm`） | ✅ 实现 | F |
 | IntakeOps 集成示例 | ✅ 走到人工审批挂起；signal 待 D | — |
 
@@ -193,7 +204,7 @@ docs/
 不满足条件的信号会**留在队列里**（可见、可重发），而不是被猜着消费。
 代价是「等待登记之前到达的未定向信号不会唤醒本次等待」—— 这个方向的错误可恢复，反方向不可恢复。
 
-## 三条不能破的规矩
+## 四条不能破的规矩
 
 1. **Definition 必须 JSON serializable。** 不允许 function / Date / Map。
    条件判断写 guard 名字（`when: "confidence.low"`），不写 JS 表达式 —— 我们不做 expression sandbox。

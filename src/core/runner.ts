@@ -170,10 +170,9 @@ export class StepRunner {
       if (timer !== null) clearTimeout(timer);
     }
 
-    // handler 无视 abort 但还是把活干完了 —— 仍然算超时（我们无法确认外部发生了什么）
-    if (controller.signal.aborted && result.status !== "failed") {
-      result = { status: "failed", error: timeoutError(stepId, step) };
-    }
+    // 注意：这里**不要**再补一次「signal 已 abort 就算超时」。
+    // 结果由上面的 race 决定：handler 先落定就信它的结果，abort 先落定就是超时。
+    // 补那一下只会在边界毫秒上把已经成功的执行误判成超时（进而被重试 → 重复副作用）。
 
     try {
       return await this.#persist({

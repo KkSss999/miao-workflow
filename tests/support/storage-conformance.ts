@@ -219,6 +219,48 @@ export function describeStorageConformance(title: string, harness: StorageHarnes
         expect(claimedByB.map((item) => item.id)).toEqual(["run-1"]);
       });
 
+      it("保留策略：只删「终态 + 已完成」的旧 run，连带 step run / signal / event", async () => {
+        const old = at();
+        clock.advance(10_000);
+        const recent = at();
+
+        // 三个 run：一个很早就完成、一个刚完成、一个还在跑
+        await storage.runs.create(
+          makeRun("old-done", old, { status: "COMPLETED", completedAt: old }),
+        );
+        await storage.runs.create(makeRun("new-done", recent, { status: "FAILED", completedAt: recent }));
+        await storage.runs.create(makeRun("running", old, { status: "RUNNING" }));
+        await storage.steps.create(makeStepRun(old, { id: "sr-old", runId: "old-done" }));
+        await storage.signals.append(makeSignal(old, { id: "sig-old", runId: "old-done" }));
+        await storage.events.append(makeEvent(old, { id: "ev-old", runId: "old-done" }));
+
+        const cutoff = new Date(CONFORMANCE_START + 5_000).toISOString();
+        expect(await storage.runs.deleteTerminalBefore(cutoff)).toBe(1);
+
+        expect(await storage.runs.get("old-done")).toBeNull();
+        expect(await storage.steps.get("sr-old")).toBeNull();
+        expect(await storage.signals.listByRun("old-done")).toEqual([]);
+        await expect(storage.events.listByRun("old-done")).resolves.toEqual([]);
+        // 幂等键索引也要跟着清掉，否则同一个 key 以后插不进来
+        expect(await storage.steps.getByIdempotencyKey("run-1:a:1")).toBeNull();
+
+        // 新的终态 & 还在跑的都留着
+        expect(await storage.runs.get("new-done")).not.toBeNull();
+        expect(await storage.runs.get("running")).not.toBeNull();
+      });
+
+      it("保留策略支持 limit 分批删", async () => {
+        const old = at();
+        for (const id of ["r-1", "r-2", "r-3"]) {
+          await storage.runs.create(makeRun(id, old, { status: "COMPLETED", completedAt: old }));
+        }
+        clock.advance(1_000);
+
+        expect(await storage.runs.deleteTerminalBefore(at(), 2)).toBe(2);
+        expect(await storage.runs.deleteTerminalBefore(at(), 2)).toBe(1);
+        expect(await storage.runs.listByStatus("COMPLETED")).toEqual([]);
+      });
+
       it("listByStatus 能按状态捞回来", async () => {
         await storage.runs.create(makeRun("run-1", at(), { status: "FAILED" }));
         await storage.runs.create(makeRun("run-2", at(), { status: "RUNNING" }));
@@ -505,7 +547,10 @@ export function describeStorageConformance(title: string, harness: StorageHarnes
         expect(await storage.schemaVersion()).toBe(SCHEMA_VERSION);
       });
 
-      it("两个 worker 抢同一个 run：只有一个拿到 lease", async () => {
+      // 注意：对 memory 来说这是**顺序执行**（单线程），证明不了真并发；
+      // 真正的并发抢占测试在 tests/postgres.test.ts（多连接 + FOR UPDATE SKIP LOCKED）。
+      // 这里保留它只是为了「同一套断言」的完整性 —— 两边至少不能出现「都抢到」。
+      it("两个 worker 抢同一个 run：只有一个拿到 lease（memory 上是顺序的，真并发见 pg 套件）", async () => {
         const registry = new Registry();
         registry.register({ "test.a": passthrough("a"), "test.b": passthrough("b"), "test.c": passthrough("c") });
         const engine = new WorkflowEngine({ storage, registry, now: clock.now, newId: sequentialIds("eng") });

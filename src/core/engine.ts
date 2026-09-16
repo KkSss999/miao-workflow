@@ -4,10 +4,16 @@ import { hashDefinition } from "../definition/validation.js";
 import { defineWorkflow, type WorkflowDefinition, type WorkflowDefinitionInput } from "../definition/workflow.js";
 import type { StepDefinition, StepId } from "../definition/step.js";
 import type { JsonObject, JsonValue } from "../json.js";
-import { RESERVED_HANDLERS, createCompleteHandler, createDelayHandler, type StepResume } from "../runtime/builtins.js";
+import { createCompleteHandler, createDelayHandler, type StepResume } from "../runtime/builtins.js";
 import type { WorkflowEventType } from "../runtime/events.js";
 import { computeBackoffMs, normalizeRetryPolicy, shouldRetry } from "../runtime/retry.js";
-import { isTerminalRunStatus, type RunStatus, type WorkflowRun, type WorkflowRunPatch } from "../runtime/run.js";
+import {
+  isTerminalRunStatus,
+  type IsoTimestamp,
+  type RunStatus,
+  type WorkflowRun,
+  type WorkflowRunPatch,
+} from "../runtime/run.js";
 import type { StepRun } from "../runtime/step-run.js";
 import type { SignalOptions } from "../runtime/signal.js";
 import type { WorkflowStorage } from "../storage/interface.js";
@@ -18,7 +24,7 @@ import {
   RunNotActiveError,
   ValidationError,
 } from "./errors.js";
-import { Registry, assertRegistryCoverage, createRegistry } from "./registry.js";
+import { Registry, RESERVED_HANDLERS, assertRegistryCoverage, createRegistry } from "./registry.js";
 import { StepRunner } from "./runner.js";
 import { resolveNextStep } from "./transitions.js";
 
@@ -72,7 +78,7 @@ export interface TickResult {
   status: RunStatus;
 }
 
-/** UNKNOWN 的人工 / 系统 reconciliation 决定。 */
+/** FAILED 的 run 的人工处置决定。 */
 export type ReconcileDecision =
   /** 确认外部没成功（或对方能按幂等键去重）→ 用**同一个幂等键**重跑 */
   | "retry"
@@ -83,6 +89,8 @@ interface WaitResolution {
   resume: StepResume;
   stepId: StepId;
   via: "signal" | "delay";
+  /** 消费信号时会更新 step run（waitPayload），调用方要把这条记录同步进本地历史 */
+  stepRun: StepRun | null;
 }
 
 /**
@@ -102,6 +110,22 @@ export class WorkflowEngine {
   readonly #newId: () => string;
   readonly #random: () => number;
   readonly #runner: StepRunner;
+
+  /**
+   * 已发布内容缓存：`workflowId@version` → hash。
+   *
+   * definition 一旦发布就不可变，所以同一个进程里重复 `start(definition)` 不必每次都打库。
+   * 只省一次写 —— 内容不一致时仍然会走到 storage，由它抛 StorageConflictError。
+   */
+  readonly #publishedHashes = new Map<string, string>();
+
+  /**
+   * definition 缓存：`workflowId@version` → definition。
+   *
+   * 同样依赖「发布即不可变」这条不变量。一个进程见过的版本数有限（远小于 run 数），
+   * 所以不需要 LRU。
+   */
+  readonly #definitions = new Map<string, WorkflowDefinition>();
 
   constructor(options: WorkflowEngineOptions) {
     this.storage = options.storage;
@@ -144,10 +168,15 @@ export class WorkflowEngine {
     const definition = defineWorkflow(input);
     assertRegistryCoverage(definition, this.registry);
 
-    await this.storage.definitions.save({
-      definition,
-      definitionHash: hashDefinition(definition),
-    });
+    const hash = hashDefinition(definition);
+    const key = `${definition.id}@${definition.version}`;
+
+    // 本进程已经发过完全一样的内容 → 不必再打库（发布不可变，重复写是纯浪费）
+    if (this.#publishedHashes.get(key) === hash) return definition;
+
+    await this.storage.definitions.save({ definition, definitionHash: hash });
+    this.#publishedHashes.set(key, hash);
+    this.#definitions.set(key, definition);
     return definition;
   }
 
@@ -264,32 +293,46 @@ export class WorkflowEngine {
   }
 
   /**
-   * UNKNOWN 的人工 / 系统 reconciliation 入口。
+   * 人工 / 系统 reconciliation 入口 —— **FAILED 的 run 也能救回来**。
    *
-   * UNKNOWN 意味着「请求超时了，但对方到底做没做不知道」——自动重试会造成重复副作用，
-   * 所以必须有人（或对账系统）看一眼再决定：
+   * 两类失败都从这里走：
    *
-   * - `"retry"`：确认没成功（或对方支持幂等键去重）→ 同一条 step run、同一个 visit、
-   *   **同一个幂等键**重跑 —— 幂等键不变是关键，下游才能去重
+   * - `UNKNOWN_OUTCOME`：请求超时了，对方到底做没做不知道。自动重试会造成重复副作用，
+   *   所以必须有人（或对账系统）看一眼再决定。
+   * - 重试耗尽的 `STEP_FAILED`：下游修好了（服务恢复、配置改正），运维想再试一次。
+   *
+   * 决定：
+   * - `"retry"`：同一条 step run、同一个 visit、**同一个幂等键**重跑 —— 幂等键不变是关键，
+   *   下游才能去重。同时把 `failures` 复位为 0：人工重试意味着「从这一刻重新开始」，
+   *   重试策略重新生效（否则 maxAttempts=1 的步骤再也不会被自动重试）。
    * - `"abandon"`：放弃，run 置为 CANCELLED（保留 error 供审计）
    */
   async reconcile(runId: string, decision: ReconcileDecision): Promise<WorkflowRun> {
     const run = await this.#requireRun(runId);
-    if (run.status !== "FAILED" || run.error?.code !== "UNKNOWN_OUTCOME") {
-      throw new RunNotActiveError(runId, run.status);
-    }
+    if (run.status !== "FAILED") throw new RunNotActiveError(runId, run.status);
 
     if (decision === "abandon") {
       const at = this.#nowIso();
       const abandoned = await this.#setRun(run, { status: "CANCELLED", wakeAt: null, completedAt: at });
-      await this.#emit(runId, null, "workflow.cancelled", { reason: "reconcile.abandon" });
+      await this.#emit(runId, null, "workflow.cancelled", {
+        reason: "reconcile.abandon",
+        ...(run.currentStepId === null ? {} : { stepId: run.currentStepId }),
+        ...(run.error === null ? {} : { previousCode: run.error.code }),
+      });
       return abandoned;
+    }
+
+    const active = await this.#activeStepRun(run);
+    if (active !== null) {
+      // 复位失败计数，让重试策略对这次人工重试重新生效
+      await this.storage.steps.update(active.id, { failures: 0 });
     }
 
     const resumed = await this.#setRun(run, { status: "RUNNING", error: null, wakeAt: null, completedAt: null });
     await this.#emit(runId, null, "workflow.resumed", {
       reason: "reconcile.retry",
       ...(run.currentStepId === null ? {} : { stepId: run.currentStepId }),
+      ...(run.error === null ? {} : { previousCode: run.error.code, previousRetryable: run.error.retryable }),
     });
     return resumed;
   }
@@ -335,6 +378,9 @@ export class WorkflowEngine {
   ): Promise<TickResult> {
     let run = initialRun;
 
+    // 历史只读一次，之后增量维护 —— 原来每一步都 listByRun（长 run 上是 O(步数²) 的行数）
+    const history = await this.storage.steps.listByRun(run.id);
+
     // 挂起解不解得开？
     //
     // 注意：判断依据是**当前 step run 的状态**，不是 run.status ——
@@ -353,6 +399,7 @@ export class WorkflowEngine {
         return { steps: 0, status: "WAITING" };
       }
 
+      if (resolution.stepRun !== null) upsert(history, resolution.stepRun);
       pendingResume = resolution.resume;
       run = await this.#setRun(run, { status: "RUNNING", wakeAt: null });
       await this.#emit(run.id, null, "workflow.resumed", {
@@ -388,7 +435,6 @@ export class WorkflowEngine {
         if (!renewed) throw new LeaseLostError(run.id);
       }
 
-      const history = await this.storage.steps.listByRun(run.id);
       const active =
         run.currentStepRunId === null
           ? null
@@ -437,6 +483,7 @@ export class WorkflowEngine {
         existing: resuming ? active : null,
         ...(resume === undefined ? {} : { resume }),
       });
+      upsert(history, outcome.stepRun);
       steps += 1;
 
       switch (outcome.status) {
@@ -544,6 +591,7 @@ export class WorkflowEngine {
         return {
           stepId: active.stepId,
           via: "signal",
+          stepRun: { ...active, waitPayload: signal.payload },
           resume: {
             waitFor,
             ...(signal.payload === undefined ? {} : { payload: signal.payload }),
@@ -555,6 +603,7 @@ export class WorkflowEngine {
         return {
           stepId: active.stepId,
           via: "delay",
+          stepRun: null,
           resume: { waitFor, wakeAt: active.wakeAt },
         };
       }
@@ -566,6 +615,7 @@ export class WorkflowEngine {
       return {
         stepId: run.currentStepId ?? "",
         via: "delay",
+        stepRun: null,
         resume: { waitFor: "unknown", wakeAt: run.wakeAt },
       };
     }
@@ -576,6 +626,22 @@ export class WorkflowEngine {
   async #activeStepRun(run: WorkflowRun): Promise<StepRun | null> {
     if (run.currentStepRunId === null) return null;
     return this.storage.steps.get(run.currentStepRunId);
+  }
+
+  /**
+   * 保留策略：删掉已经结束且结束时间早于 `before` 的 run（连带它的 step run / signal / event）。
+   *
+   * 审计数据只增不减，一个高频 workflow 跑一年就是几千万行 —— 定期调用它，或者在外面挂个 cron。
+   * 只删终态：RUNNING / WAITING 的 run 可能正被别的 worker 处理。
+   *
+   * @example 只保留最近 30 天
+   * ```ts
+   * await engine.prune({ before: new Date(Date.now() - 30 * 86_400_000).toISOString() });
+   * ```
+   */
+  async prune(input: { before: IsoTimestamp; limit?: number }): Promise<{ deletedRuns: number }> {
+    const deletedRuns = await this.storage.runs.deleteTerminalBefore(input.before, input.limit);
+    return { deletedRuns };
   }
 
   /** 执行一步之后决定下一步：合并 patch → resolveNextStep → 落 run 状态。 */
@@ -645,8 +711,13 @@ export class WorkflowEngine {
 
   /** run 绑死的那个版本 —— 不是「最新版」。 */
   async #requireDefinitionVersion(run: WorkflowRun): Promise<WorkflowDefinition> {
+    const key = `${run.workflowId}@${run.workflowVersion}`;
+    const cached = this.#definitions.get(key);
+    if (cached !== undefined) return cached;
+
     const definition = await this.storage.definitions.get(run.workflowId, run.workflowVersion);
     if (definition === null) throw new DefinitionNotFoundError(run.workflowId, run.workflowVersion);
+    this.#definitions.set(key, definition);
     return definition;
   }
 
@@ -715,6 +786,13 @@ export class WorkflowClient {
 
 function lastOf<T>(items: T[]): T | null {
   return items.length === 0 ? null : (items[items.length - 1] as T);
+}
+
+/** 把一条 step run 同步进本地历史（有就替换，没有就追加 —— 顺序仍然是插入顺序） */
+function upsert(history: StepRun[], stepRun: StepRun): void {
+  const index = history.findIndex((item) => item.id === stepRun.id);
+  if (index === -1) history.push(stepRun);
+  else history[index] = stepRun;
 }
 
 /**

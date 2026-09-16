@@ -168,7 +168,7 @@ describe("Phase F.worker: 接进 engine", () => {
       { input: { text: "报价 1200 CNY" } },
     );
 
-    expect(await h.worker.tick()).toEqual({ claimed: 1, processed: 1, failed: 0 });
+    expect(await h.worker.tick()).toEqual({ claimed: 1, handled: 1, failed: 0, completed: 1 });
     expect((await h.engine.get(run.id)).status).toBe("COMPLETED");
     expect(h.calls).toEqual(["after"]);
 
@@ -194,7 +194,7 @@ describe("Phase F.worker: 接进 engine", () => {
     const startedAt = Date.now();
     const result = await h.worker.tick();
 
-    expect(result.processed).toBe(1);
+    expect(result.handled).toBe(1);
     expect(Date.now() - startedAt).toBeLessThan(3_000);
 
     const final = await h.engine.get(run.id);

@@ -129,5 +129,3 @@ export interface StepResume {
   /** 信号带的 payload */
   payload?: JsonValue;
 }
-
-export { RESERVED_HANDLERS };

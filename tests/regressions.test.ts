@@ -294,6 +294,211 @@ describe("回归: 直接调 engine.tick({owner}) 时，挂起也要交还 lease"
   });
 });
 
+describe("回归: 永久 FAILED 的 run 也能被人工救回来", () => {
+  it("重试耗尽的 FAILED → reconcile(retry) → 同幂等键重跑并跑完", async () => {
+    const h = createHarness();
+    const { WorkflowError } = await import("../src/index.js");
+    let failUntil = 2;
+    h.registry.register({
+      "test.flaky": {
+        async execute(): Promise<StepResult> {
+          if (failUntil > 0) {
+            failUntil -= 1;
+            return { status: "failed", error: new WorkflowError("下游挂了", { code: "STEP_FAILED", retryable: true }) };
+          }
+          return { status: "completed", patch: { recovered: true } };
+        },
+      },
+    });
+
+    const run = await h.engine.start(
+      defineWorkflow({
+        id: "reconcile-failed",
+        version: 1,
+        start: "a",
+        steps: { a: { uses: "test.flaky", retry: { maxAttempts: 2, initialDelayMs: 1, jitter: false } } },
+      }),
+    );
+
+    // 跑到永久失败
+    await h.worker.tick();
+    h.advance(1);
+    await h.worker.tick();
+    const failed = await h.engine.get(run.id);
+    expect(failed.status).toBe("FAILED");
+    expect(failed.error?.code).toBe("STEP_FAILED");
+
+    const stepRunBefore = (await h.storage.steps.listByRun(run.id))[0];
+    expect(stepRunBefore?.failures).toBe(2);
+    expect(stepRunBefore?.idempotencyKey).toBe(`${run.id}:a:1`);
+
+    // 运维修好了下游 → 人工重试
+    expect((await h.engine.reconcile(run.id, "retry")).status).toBe("RUNNING");
+    await h.worker.tick();
+
+    const final = await h.engine.get(run.id);
+    expect(final.status).toBe("COMPLETED");
+    expect(final.context).toEqual({ recovered: true });
+
+    // 同一条 step run、同一个幂等键 —— 下游才能去重
+    const stepRuns = await h.storage.steps.listByRun(run.id);
+    expect(stepRuns).toHaveLength(1);
+    expect(stepRuns[0]?.idempotencyKey).toBe(`${run.id}:a:1`);
+    expect(stepRuns[0]?.attempt).toBe(3);
+    expect(stepRuns[0]?.failures).toBe(0); // 人工重试复位了失败计数
+
+    const events = (await h.storage.events.listByRun(run.id)).map((item) => item.type);
+    expect(events).toContain("workflow.resumed");
+  });
+
+  it("人工重试之后，自动重试策略重新生效", async () => {
+    const h = createHarness();
+    const { WorkflowError } = await import("../src/index.js");
+    let failures = 0;
+    h.registry.register({
+      "test.once": {
+        async execute(): Promise<StepResult> {
+          failures += 1;
+          // 第 1、2 次失败（maxAttempts=2 用完 → 永久失败），第 3 次成功
+          if (failures <= 2) {
+            return { status: "failed", error: new WorkflowError("挂了", { code: "STEP_FAILED", retryable: true }) };
+          }
+          return { status: "completed" };
+        },
+      },
+    });
+
+    const run = await h.engine.start(
+      defineWorkflow({
+        id: "reconcile-budget",
+        version: 1,
+        start: "a",
+        steps: { a: { uses: "test.once", retry: { maxAttempts: 2, initialDelayMs: 1, jitter: false } } },
+      }),
+    );
+
+    await h.worker.tick(); // 第 1 次失败 → RETRYING
+    h.advance(1);
+    await h.worker.tick(); // 第 2 次失败 → FAILED（预算用完）
+    expect((await h.engine.get(run.id)).status).toBe("FAILED");
+
+    await h.engine.reconcile(run.id, "retry");
+    await h.worker.tick(); // 第 3 次 → 成功
+
+    expect((await h.engine.get(run.id)).status).toBe("COMPLETED");
+    expect(failures).toBe(3);
+  });
+
+  it("abandon 也能用在永久失败上，并保留原来的错误码供审计", async () => {
+    const h = createHarness();
+    const { WorkflowError } = await import("../src/index.js");
+    h.registry.register({
+      "test.dead": {
+        async execute(): Promise<StepResult> {
+          return { status: "failed", error: new WorkflowError("没救了", { code: "STEP_FAILED" }) };
+        },
+      },
+    });
+
+    const run = await h.engine.start(
+      defineWorkflow({ id: "reconcile-abandon", version: 1, start: "a", steps: { a: { uses: "test.dead" } } }),
+    );
+    await h.worker.tick();
+    expect((await h.engine.get(run.id)).status).toBe("FAILED");
+
+    const abandoned = await h.engine.reconcile(run.id, "abandon");
+    expect(abandoned.status).toBe("CANCELLED");
+    expect(abandoned.error?.code).toBe("STEP_FAILED"); // 审计保留
+
+    const cancelled = (await h.storage.events.listByRun(run.id)).filter(
+      (item) => item.type === "workflow.cancelled",
+    );
+    expect(cancelled[0]?.payload["previousCode"]).toBe("STEP_FAILED");
+  });
+
+  it("没失败的 run 不允许 reconcile", async () => {
+    const h = createHarness();
+    h.registry.register({ "test.ok": h.tracked("ok") });
+    const run = await h.engine.start(
+      defineWorkflow({ id: "reconcile-guard", version: 1, start: "a", steps: { a: { uses: "test.ok" } } }),
+    );
+    await h.worker.tick();
+
+    await expect(h.engine.reconcile(run.id, "retry")).rejects.toThrow(/不接受该操作/);
+  });
+});
+
+describe("优化回归: publish / definition 缓存不能改变语义", () => {
+  it("同一份 definition 重复发布只写一次库（但内容不同仍然报冲突）", async () => {
+    const h = createHarness();
+    h.registry.register({ "test.a": h.tracked("a") });
+
+    let saves = 0;
+    const original = h.storage.definitions.save.bind(h.storage.definitions);
+    h.storage.definitions.save = async (input) => {
+      saves += 1;
+      return original(input);
+    };
+
+    const definition = defineWorkflow({
+      id: "cached-publish",
+      version: 1,
+      start: "a",
+      steps: { a: { uses: "test.a" } },
+    });
+
+    await h.engine.start(definition);
+    await h.engine.start(definition);
+    await h.engine.start(definition);
+    expect(saves).toBe(1); // 后两次命中缓存
+
+    // 同版本不同内容 → 依然要走库，让 storage 抛冲突
+    const changed = defineWorkflow({
+      id: "cached-publish",
+      version: 1,
+      start: "a",
+      steps: { a: { uses: "test.a", meta: { title: "改了" } } },
+    });
+    await expect(h.engine.start(changed)).rejects.toThrow(/已发布/);
+    expect(saves).toBe(2);
+
+    // 新版本照常发布
+    const v2 = defineWorkflow({
+      id: "cached-publish",
+      version: 2,
+      start: "a",
+      steps: { a: { uses: "test.a" } },
+    });
+    await h.engine.publish(v2);
+    expect(saves).toBe(3);
+  });
+
+  it("definition 读取走缓存：连续 tick 不会再查库", async () => {
+    const h = createHarness();
+    h.registry.register({ "test.a": h.tracked("a") });
+    const definition = defineWorkflow({
+      id: "cached-definition",
+      version: 1,
+      start: "a",
+      steps: { a: { uses: "test.a", next: "b" }, b: { uses: "test.b" } },
+    });
+    h.registry.register({ "test.b": h.tracked("b") });
+
+    const run = await h.engine.start(definition);
+
+    let reads = 0;
+    const original = h.storage.definitions.get.bind(h.storage.definitions);
+    h.storage.definitions.get = async (workflowId, version) => {
+      reads += 1;
+      return original(workflowId, version);
+    };
+
+    await h.engine.tick(run.id);
+    await h.engine.tick(run.id);
+    expect(reads).toBe(0); // publish 时已经缓存了
+  });
+});
+
 describe("回归: 事件游标不存在时必须报错（两个适配器一致）", () => {
   it("memory：抛 ValidationError，而不是返回全部", async () => {
     const storage = new MemoryWorkflowStorage();

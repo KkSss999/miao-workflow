@@ -73,6 +73,15 @@ export interface RunStore {
   renewLease(runId: string, owner: string, leaseMs: number, now?: string): Promise<boolean>;
   /** 主动释放，让别的 worker 马上能接手。 */
   releaseLease(runId: string, owner: string): Promise<void>;
+
+  /**
+   * 保留策略：删除**终态**且 `completedAt < before` 的 run（连带 step run / signal / event）。
+   *
+   * 只删终态 —— RUNNING / WAITING 的 run 可能正被别的 worker 处理，删掉就是数据事故。
+   *
+   * @returns 实际删掉的 run 数
+   */
+  deleteTerminalBefore(before: string, limit?: number): Promise<number>;
 }
 
 export interface StepRunStore {

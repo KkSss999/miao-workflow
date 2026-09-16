@@ -481,6 +481,27 @@ class PostgresRunStore implements RunStore {
     );
   }
 
+  /**
+   * 保留策略。step run / signal / event 都是 `ON DELETE CASCADE`，所以一条 DELETE 就够。
+   *
+   * `LIMIT` 放进子查询：一次删太多会长时间持锁，运维上更希望「分批删干净」。
+   */
+  async deleteTerminalBefore(before: string, limit?: number): Promise<number> {
+    const result = await this.storage.client.query(
+      `DELETE FROM workflow_runs
+        WHERE id IN (
+              SELECT id FROM workflow_runs
+               WHERE status IN ('COMPLETED','FAILED','CANCELLED')
+                 AND completed_at IS NOT NULL
+                 AND completed_at < $1::timestamptz
+               ORDER BY created_at, seq
+               LIMIT $2
+        )`,
+      [before, limit ?? null],
+    );
+    return result.rowCount ?? 0;
+  }
+
   async #update(runId: string, patch: WorkflowRunPatch): Promise<void> {
     const sets: string[] = [];
     const values: unknown[] = [];

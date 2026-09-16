@@ -1,4 +1,4 @@
-import { deserializeError, type SerializedWorkflowError, type WorkflowError } from "../core/errors.js";
+import type { SerializedWorkflowError } from "../core/errors.js";
 import type { StepId } from "../definition/step.js";
 import type { JsonObject, JsonValue } from "../json.js";
 import type { IsoTimestamp } from "./run.js";
@@ -99,10 +99,3 @@ export function buildIdempotencyKey(runId: string, stepId: StepId, visit: number
   return `${runId}:${stepId}:${visit}`;
 }
 
-export function serializeStepError(error: WorkflowError): SerializedWorkflowError {
-  return error.toJSON();
-}
-
-export function stepRunError(stepRun: StepRun): WorkflowError | null {
-  return stepRun.error === null ? null : deserializeError(stepRun.error);
-}

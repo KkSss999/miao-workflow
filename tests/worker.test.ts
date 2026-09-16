@@ -39,7 +39,7 @@ describe("Phase C: Worker", () => {
 
     const result = await h.worker.tick();
 
-    expect(result).toEqual({ claimed: 1, processed: 1, failed: 0 });
+    expect(result).toEqual({ claimed: 1, handled: 1, failed: 0, completed: 1 });
     const final = await h.engine.get(run.id);
     expect(final.status).toBe("COMPLETED");
     expect(final.leaseOwner).toBeNull();
@@ -56,7 +56,7 @@ describe("Phase C: Worker", () => {
     const result = await h.worker.tick();
 
     expect(result.claimed).toBe(3);
-    expect(result.processed).toBe(3);
+    expect(result.handled).toBe(3);
     // 三个 run 都被推进完了
     expect(h.calls).toHaveLength(9);
     // 再 tick 没有活可干
@@ -71,7 +71,7 @@ describe("Phase C: Worker", () => {
     const stolen = await h.storage.runs.claimDue({ owner: "other", limit: 1, leaseMs: 60_000 });
     expect(stolen).toHaveLength(1);
 
-    expect(await h.worker.tick()).toEqual({ claimed: 0, processed: 0, failed: 0 });
+    expect(await h.worker.tick()).toEqual({ claimed: 0, handled: 0, failed: 0, completed: 0 });
   });
 
   it("crash recovery：worker A 死了（lease 没释放），租期过后 B 接着跑", async () => {
@@ -89,7 +89,7 @@ describe("Phase C: Worker", () => {
     h.advance(30_001);
     const result = await h.worker.tick();
 
-    expect(result).toEqual({ claimed: 1, processed: 1, failed: 0 });
+    expect(result).toEqual({ claimed: 1, handled: 1, failed: 0, completed: 1 });
     expect((await h.engine.get(run.id)).status).toBe("COMPLETED");
     // A 留下的悬空指针被复用：同一个 step run id + 同一个幂等键
     const first = (await h.storage.steps.listByRun(run.id))[0];
@@ -111,7 +111,8 @@ describe("Phase C: Worker", () => {
 
     expect(result.claimed).toBe(2);
     expect(result.failed).toBe(1);
-    expect(result.processed).toBe(1);
+    expect(result.handled).toBe(1);
+    expect(result.completed).toBe(1); // good 那个跑完了，broken 那个没有
     expect((await h.engine.get(good.id)).status).toBe("COMPLETED");
     expect((await h.engine.get(broken.id)).status).toBe("RUNNING");
   });
@@ -204,7 +205,7 @@ describe("Phase C: Worker", () => {
     expect((await other.worker.tick()).claimed).toBe(0);
 
     const result = await ticking;
-    expect(result).toEqual({ claimed: 1, processed: 1, failed: 0 });
+    expect(result).toEqual({ claimed: 1, handled: 1, failed: 0, completed: 1 });
     expect((await h.engine.get(run.id)).status).toBe("COMPLETED");
   });
 
@@ -218,7 +219,8 @@ describe("Phase C: Worker", () => {
     await h.worker.drain();
     const result = await ticking;
 
-    expect(result.processed).toBe(2);
+    expect(result.handled).toBe(2);
+    expect(result.completed).toBe(2);
   });
 });
 

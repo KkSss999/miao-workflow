@@ -1,0 +1,54 @@
+{
+  "name": "@catease/workflow",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Embedded durable workflow runtime for TypeScript.",
+  "keywords": [
+    "workflow",
+    "durable",
+    "orchestration",
+    "state-machine",
+    "human-in-the-loop",
+    "typescript"
+  ],
+  "license": "UNLICENSED",
+  "author": "KkSss999",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KkSss999/miaoworkflow.git"
+  },
+  "homepage": "https://github.com/KkSss999/miaoworkflow#readme",
+  "bugs": "https://github.com/KkSss999/miaoworkflow/issues",
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@10.32.1",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "pnpm run clean && tsc -p tsconfig.build.json",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "pnpm run typecheck && pnpm run test"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.5",
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.1"
+  }
+}

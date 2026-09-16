@@ -59,31 +59,45 @@ pnpm build      # tsc → dist/
 
 ## 当前进度（新增功能时同步更新）
 
-Phase A 之前。**已实现并有测试**：
+**Phase A 已完成**（73 个测试全绿）。已实现：
 
 - `src/json.ts`、`src/definition/*`（归一化 / 校验 / hash / stableStringify）
-- `src/core/errors.ts`、`registry.ts`、`transitions.ts`
+- `src/core/*`：errors / registry（含 publish 前的 `assertRegistryCoverage`）/ transitions /
+  **runner（handler 调用 · 结果 JSON 校验 · 超时 · 落 step run）** / **engine（start · tick · 事件流）**
 - `src/runtime/*`（状态机与记录类型、retry backoff 计算）
-- `src/storage/memory.ts`（五类 Store 全部实现）
+- `src/storage/memory.ts`（五类 Store 全部实现，语义与 Postgres 对齐）
 
-**是桩，不要当已实现来用**：
+**仍是桩，不要当已实现来用**：
 
 | 桩 | 抛什么 | Phase |
 |---|---|---|
-| `WorkflowEngine.start` / `tick` | `NotImplementedError` | A |
-| `StepRunner.executeStep` | `NotImplementedError` | A |
 | `PostgresWorkflowStorage.*` | `NotImplementedError` | B |
 | `WorkflowWorker.tick` | `NotImplementedError` | C |
 | `WorkflowEngine.signal` / `cancel` | `NotImplementedError` | D |
 
 `Scheduler` / `LeaseManager` 已可用（调度循环与 lease 心跳是真的）。
 
-## 下一步（Phase A）
+## Phase A 定下来的语义（改之前先读懂，否则会破坏崩溃恢复）
 
-`engine.start()`：publish definition → 建 `WorkflowRun`（CREATED）+ 首个 `StepRun`(PENDING) →
-写 `workflow.created` 事件。
-`engine.tick(runId)`：claim → `StepRunner.executeStep` → handler → 落 step_run →
-合并 patch → `resolveNextStep` → 下一步；撞 `maxStepsPerTick` 就 requeue。
+1. **「我做到哪」= `run.currentStepId` + `run.currentStepRunId` 指针。**
+   - 指针指向的 step run 是 COMPLETED → 恢复时**只重放 patch，不重放副作用**（patch 存在 step run 里）
+   - 指针为空 → 下一步是一次全新的访问；回边的 visit 自然 +1
+   - 指针悬空（写下指针后、step run 落库前崩了）→ 复用**同一个 step run id 与同一幂等键**
+2. **执行前先写指针**（`currentStepRunId`），否则「已完成但没推进」这个窗口会变成重复副作用。
+3. **visit 完全由已落库的记录推导**：`(latest?.visit ?? 0) + 1`（同一 visit 内重试复用记录）。
+4. **`input` = 上一个 COMPLETED 且 stepId 不同的 step run 的 output**；首步为 `run.input`。
+5. **run 级事件（`workflow.*`）的 `stepId` 必须是 null**，具体步骤放 payload；`step.*` 才带 stepId。
+6. **撞到 `maxStepsPerTick` 不是错误**：交回队列（release lease），下一轮从 `currentStepId` 继续。
+7. **UNKNOWN 永不自动重试**；可重试的失败才写 RETRYING + wake_at。
+8. **内存 storage 的自然顺序 = Map 插入顺序**，`createdAt` 并列时不要用 id 做 tiebreak
+   （字符串序下 `"id-10" < "id-2"`）。
 
-对应的测试（先写测试再实现，见 `docs/architecture.md` 的「测试即规格」）：
-`A → B → C`、条件分支、`maxStepsPerTick` 防死循环。
+## 下一步（Phase B：Postgres，与 A 并行推进）
+
+五张表见 `docs/postgres-schema.sql`（`current_step_run_id` 与 `patch` 两列已经对上 A 的语义）。
+实现五个 Store 的 SQL + JSONB 行↔记录映射；`claimDue` 必须用 `FOR UPDATE SKIP LOCKED` 并在**同一条
+语句/事务**里写上 lease；测试用 `scripts/test-postgres.sh`（临时容器 + `MWF_TEST_POSTGRES_URL`），
+没有环境时 `describe.skipIf` 跳过，不要假装测过。
+
+之后：C（retry 端到端 / lease 接入 / crash recovery / UNKNOWN）→ D（signal / delay / cancel）→
+F（WASM handler 宿主，独立扩展包）。E 不再作为阶段：IntakeOps 集成在 D 之后顺手验证。

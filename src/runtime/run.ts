@@ -82,6 +82,19 @@ export interface WorkflowRun {
   /** 即将执行的 step；null 表示还没开始或已结束 */
   currentStepId: StepId | null;
 
+  /**
+   * 当前正在处理的那条 step run —— 这是「我做到哪」的唯一权威指针。
+   *
+   * 它消掉了两种情况的歧义：
+   * - 崩溃在「step 已落库、run 还没推进」之间 → 指针仍指向那条 COMPLETED，
+   *   恢复时直接重放 patch 并前移，**不重放副作用**
+   * - 回边（A→B→A）→ 指针已被清空，于是新建一条 visit+1 的记录，是新的一次执行
+   *
+   * 指针可能短暂指向一条还没落库的记录（执行中崩了），恢复时按同一 id、同一
+   * visit 重来，幂等键因此在崩溃前后保持不变。
+   */
+  currentStepRunId: string | null;
+
   /** WAITING / RETRYING 到点时间；ACTIVE 状态为 null */
   wakeAt: IsoTimestamp | null;
 

@@ -13,6 +13,7 @@ export type WorkflowErrorCode =
   | "UNKNOWN_OUTCOME"
   | "RUN_NOT_FOUND"
   | "STEP_RUN_NOT_FOUND"
+  | "DEFINITION_NOT_FOUND"
   | "RUN_NOT_ACTIVE"
   | "LEASE_LOST"
   | "STORAGE_CONFLICT"
@@ -111,6 +112,21 @@ export class RunNotFoundError extends WorkflowError {
 export class StepRunNotFoundError extends WorkflowError {
   constructor(stepRunId: string) {
     super(`step run "${stepRunId}" 不存在`, { code: "STEP_RUN_NOT_FOUND", details: { stepRunId } });
+  }
+}
+
+/** definition 还没发布（或版本不存在）。 */
+export class DefinitionNotFoundError extends WorkflowError {
+  constructor(workflowId: string, version?: number) {
+    super(
+      version === undefined
+        ? `workflow "${workflowId}" 还没发布任何版本`
+        : `workflow "${workflowId}" v${version} 不存在`,
+      {
+        code: "DEFINITION_NOT_FOUND",
+        details: version === undefined ? { workflowId } : { workflowId, version },
+      },
+    );
   }
 }
 

@@ -1,4 +1,5 @@
 import type { GuardName, HandlerName, StepId } from "../definition/step.js";
+import type { WorkflowDefinition } from "../definition/workflow.js";
 import type { JsonObject, JsonValue } from "../json.js";
 import {
   DuplicateRegistrationError,
@@ -154,4 +155,62 @@ export const RESERVED_HANDLER_NAMES: readonly string[] = Object.values(RESERVED_
 
 export function isReservedHandler(name: HandlerName): boolean {
   return RESERVED_HANDLER_NAMES.includes(name);
+}
+
+/** 只做“有没有注册”的查询，不要求完整 Registry（便于测试与扩展包实现） */
+export interface HandlerLookup {
+  has(name: HandlerName): boolean;
+}
+
+export interface GuardLookup {
+  hasGuard(name: GuardName): boolean;
+}
+
+export interface RegistryCoverage {
+  missingHandlers: HandlerName[];
+  missingGuards: GuardName[];
+}
+
+/**
+ * definition 里引用的 handler / guard 是不是都注册了。
+ *
+ * 这是 publish 与 start 的卡点：宁可启动时炸，也不要跑到一半才发现某个 step 没人实现。
+ */
+export function checkRegistryCoverage(
+  definition: WorkflowDefinition,
+  lookup: HandlerLookup & GuardLookup,
+): RegistryCoverage {
+  const missingHandlers = new Set<HandlerName>();
+  const missingGuards = new Set<GuardName>();
+
+  for (const step of Object.values(definition.steps)) {
+    if (!lookup.has(step.uses)) missingHandlers.add(step.uses);
+    for (const transition of step.next) {
+      if (transition.when !== undefined && !lookup.hasGuard(transition.when)) {
+        missingGuards.add(transition.when);
+      }
+    }
+  }
+
+  return {
+    missingHandlers: [...missingHandlers].sort(),
+    missingGuards: [...missingGuards].sort(),
+  };
+}
+
+/** @throws ValidationError 有任何一个 handler / guard 没注册 */
+export function assertRegistryCoverage(
+  definition: WorkflowDefinition,
+  lookup: HandlerLookup & GuardLookup,
+): void {
+  const { missingHandlers, missingGuards } = checkRegistryCoverage(definition, lookup);
+  if (missingHandlers.length === 0 && missingGuards.length === 0) return;
+
+  const parts: string[] = [];
+  if (missingHandlers.length > 0) parts.push(`handler: ${missingHandlers.join(", ")}`);
+  if (missingGuards.length > 0) parts.push(`guard: ${missingGuards.join(", ")}`);
+
+  throw new ValidationError(`workflow "${definition.id}" v${definition.version} 缺少注册：${parts.join("；")}`, {
+    details: { workflowId: definition.id, version: definition.version, missingHandlers, missingGuards },
+  });
 }

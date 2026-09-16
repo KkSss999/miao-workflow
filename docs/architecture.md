@@ -244,13 +244,57 @@ RBAC · 多租户 · Connector 市场 · Redis 依赖 · Kubernetes · 分布式
 
 ## 阶段
 
-| Phase | 内容 | 目标 |
+| Phase | 内容 | 目标 | 状态 |
+|---|---|---|---|
+| **A** | Definition · Registry · Handler · Transition · Engine · 事件流 | `A → B → C` + 条件分支 + 崩溃不重放副作用 | ✅ 完成 |
+| **B** | PostgresStorage · Run/StepRun/Events · 版本化 | `kill -9` → 重启 → 继续 | 与 A 并行 |
+| **C** | Retry 端到端 · Lease 接入 · Crash Recovery · UNKNOWN | 崩溃与重复都不出错 | — |
+| **D** | Signal · Wait · Resume · Delay · Cancel | **Core V1 完成** | — |
+| **F** | WASM handler 宿主（独立扩展包） | 第三方打包一个 wasm 就接进来 | 设计已定 |
+
+E（包住 IntakeOps）不再作为阶段 —— D 完成之后顺手验证即可。
+
+## 崩溃恢复：指针 + 重放（Phase A 定死）
+
+「进程随时可以被 kill -9」要能成立，必须回答一个问题：**我怎么知道做到哪了？**
+
+答案是 run 上的一对指针：
+
+```
+current_step_id     我在哪一步
+current_step_run_id 我正在处理哪一条 step run 记录
+```
+
+三种窗口的处理方式：
+
+| 崩在哪 | 恢复时看到 | 行为 |
 |---|---|---|
-| **A** | Definition · Registry · Handler · Transition · MemoryStorage · Engine | `A → B → C` + 条件分支跑通 |
-| **B** | PostgresStorage · Run/StepRun/Events · 版本化 | `kill -9` → 重启 → 继续 |
-| **C** | Retry · Backoff · Timeout · Idempotency · Lease · Crash Recovery | 崩溃与重复都不出错 |
-| **D** | Signal · Wait · Resume · Delay · Cancel | **Core V1 完成** |
-| **E** | IntakeOps 集成（包装现有 service，不重写） | 第一次真实 dogfood |
+| 执行中（step run 还没落库） | 指针悬空，记录不存在 | 复用**同一个 id 与同一个幂等键**重来 —— 外部服务认得出这是同一次动作 |
+| step run 已落库 COMPLETED，run 还没推进 | 指针指向一条 COMPLETED | **不重放副作用**，只把 `patch` 重放回 context 然后前移 |
+| run 已推进 | 指针为空 | 下一步是一次全新访问 |
+
+这就是为什么要：
+
+1. **执行前先写指针** —— 否则「已完成但没推进」会退化成重复副作用
+2. **把 `patch` 单独存进 step run** —— 这样恢复不需要重跑 handler 就能重建 context
+3. **不做 deterministic replay** —— 我们重放的是**状态**，不是代码
+
+`visit` 完全由已落库的记录推导（`(latest?.visit ?? 0) + 1`），所以同一个 visit 内的重试复用同一条记录，
+回边（A→B→A）则自然得到新的 visit，幂等键不会撞车。
+
+## 扩展：WASM handler 宿主（Phase F）
+
+目标：第三方**打包一个 wasm 模块、注册一个名字**就接进来。
+
+三条约束，保证它不污染 Core：
+
+1. **它是 extension，不是 Core。** Core 只认 `StepHandler` 接口；wasm 只是它的一个宿主实现
+   （独立包 `@catease/workflow-wasm`）。「Core 不认识业务」这条规矩不用破。
+2. **IO 必须由宿主中介。** 沙箱里没有 `fetch`：要么走 `wasi:http` + 白名单，要么由宿主提供受限
+   capability 函数。**V1 的 wasm handler 只做纯计算**（提取 / 校验 / 规则判定 / 模板渲染），
+   天然幂等；有 IO 的继续用 TS handler。
+3. **边界保持 JSON in / JSON out。** `input` / `context` / `output` / `patch` / `error` 全是 JSON，
+   `idempotencyKey` 与 `AbortSignal` 由宿主提供 —— 这样 ABI 落地时不用动 Core。
 
 ## 测试即规格
 

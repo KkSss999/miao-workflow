@@ -31,7 +31,12 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
 
     input            jsonb,
     context          jsonb       NOT NULL DEFAULT '{}'::jsonb,
-    current_step_id  text,
+
+    -- 我做到哪了：current_step_id + current_step_run_id 组成唯一的权威指针
+    --   指针指向一条 COMPLETED → 崩溃恢复时只重放 patch，不重放副作用
+    --   指针为空 → 下一步是一次全新的访问（回边时 visit 自然 +1）
+    current_step_id     text,
+    current_step_run_id text,
 
     -- WAITING / RETRYING 的到点时间；等信号的 WAITING 为 NULL（抢了也没信号可消费）
     wake_at          timestamptz,
@@ -79,6 +84,8 @@ CREATE TABLE IF NOT EXISTS workflow_step_runs (
 
     input           jsonb,
     output          jsonb,
+    -- 这一步对 context 的贡献。单独存一份，崩溃恢复时不必重跑 handler 就能重建 context
+    patch           jsonb,
     error           jsonb,
 
     wait_for        text,

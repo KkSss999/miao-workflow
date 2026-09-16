@@ -250,16 +250,15 @@ class MemoryStepRunStore implements StepRunStore {
   }
 
   async listByRun(runId: string): Promise<StepRun[]> {
-    return clone(
-      [...this.storage.stepRunsMap().values()].filter((stepRun) => stepRun.runId === runId).sort(byCreatedAt),
-    );
+    // Map 的迭代顺序就是插入顺序 —— 这也是内存实现里「时间」的自然定义
+    return clone([...this.storage.stepRunsMap().values()].filter((stepRun) => stepRun.runId === runId));
   }
 
   async listByStatus(runId: string, status: StepStatus): Promise<StepRun[]> {
     return clone(
-      [...this.storage.stepRunsMap().values()]
-        .filter((stepRun) => stepRun.runId === runId && stepRun.status === status)
-        .sort(byCreatedAt),
+      [...this.storage.stepRunsMap().values()].filter(
+        (stepRun) => stepRun.runId === runId && stepRun.status === status,
+      ),
     );
   }
 
@@ -296,9 +295,7 @@ class MemorySignalStore implements SignalStore {
   }
 
   async listByRun(runId: string): Promise<WorkflowSignal[]> {
-    return clone(
-      [...this.storage.signalsMap().values()].filter((signal) => signal.runId === runId).sort(byCreatedAt),
-    );
+    return clone([...this.storage.signalsMap().values()].filter((signal) => signal.runId === runId));
   }
 
   async countPending(runId: string): Promise<number> {
@@ -318,9 +315,7 @@ class MemoryEventStore implements EventStore {
   }
 
   async listByRun(runId: string, options: { limit?: number; after?: string } = {}): Promise<WorkflowEvent[]> {
-    const all = [...this.storage.eventsMap().values()]
-      .filter((event) => event.runId === runId)
-      .sort(byCreatedAt);
+    const all = [...this.storage.eventsMap().values()].filter((event) => event.runId === runId);
 
     const startIndex = options.after === undefined ? 0 : all.findIndex((event) => event.id === options.after) + 1;
     const sliced = all.slice(startIndex);
@@ -328,7 +323,11 @@ class MemoryEventStore implements EventStore {
   }
 }
 
-function byCreatedAt(a: { createdAt: string; id: string }, b: { createdAt: string; id: string }): number {
-  if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? -1 : 1;
-  return a.id.localeCompare(b.id);
+/**
+ * 只比 createdAt。同一时刻的并列用插入顺序（Array#sort 是稳定排序）——
+ * 注意不要用 id 做 tiebreak：字符串序下 "id-10" < "id-2"，那是排障时的经典陷阱。
+ */
+function byCreatedAt(a: { createdAt: string }, b: { createdAt: string }): number {
+  if (a.createdAt === b.createdAt) return 0;
+  return a.createdAt < b.createdAt ? -1 : 1;
 }

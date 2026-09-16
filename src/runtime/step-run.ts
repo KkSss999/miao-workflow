@@ -1,6 +1,6 @@
 import { deserializeError, type SerializedWorkflowError, type WorkflowError } from "../core/errors.js";
 import type { StepId } from "../definition/step.js";
-import type { JsonValue } from "../json.js";
+import type { JsonObject, JsonValue } from "../json.js";
 import type { IsoTimestamp } from "./run.js";
 
 /**
@@ -45,6 +45,13 @@ export interface StepRun {
 
   input: JsonValue | undefined;
   output: JsonValue | undefined;
+  /**
+   * 这一步对 context 的贡献。
+   *
+   * 单独存一份，是为了让 step run 自包含：崩溃恢复时不必重新执行 handler 就能
+   * 把 context 重建出来（不做 deterministic replay，只做状态重放）。
+   */
+  patch: JsonObject | undefined;
   error: SerializedWorkflowError | null;
 
   /** waiting 时等的是什么（signal 名） */

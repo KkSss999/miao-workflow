@@ -68,8 +68,9 @@ Core 只知道 `Workflow · Run · Step · Transition · Handler · Signal · Re
 
 ## 状态
 
-骨架已落地：类型层、校验层、注册表、转移解析、重试策略、内存 storage **已经实现并有测试**；
-Engine / Worker / PostgreSQL 是**有完整形状的桩**，按 Phase 逐步填充。
+Phase A 已完成：`engine.start` / `engine.tick` / `StepRunner.execute` 是真的，**顺序执行、条件分支、
+崩溃恢复（不重放副作用）、版本绑定、防死循环都跑通了**（73 个测试）。
+Postgres 适配器、Worker 抢占循环、signal/delay 仍是桩，按 Phase 填充。
 
 | 模块 | 状态 | Phase |
 |---|---|---|
@@ -81,16 +82,21 @@ Engine / Worker / PostgreSQL 是**有完整形状的桩**，按 Phase 逐步填�
 | Retry 策略（fixed / exponential / jitter / cap） | ✅ 实现 | — |
 | `MemoryWorkflowStorage`（definition / run / step / signal / event） | ✅ 实现 | — |
 | Run / Step 状态机与记录类型 | ✅ 实现 | — |
-| `WorkflowEngine.start / tick` | 🚧 桩 | A |
-| `StepRunner.executeStep` | 🚧 桩 | A |
+| `WorkflowEngine.start / tick`（顺序执行 · 条件分支 · 事件流） | ✅ 实现 | A |
+| `StepRunner.execute`（handler 调用 · 结果校验 · 超时 · 落库） | ✅ 实现 | A |
+| 崩溃恢复：不重放副作用，patch 从 step run 重放 | ✅ 实现 | A |
+| 版本绑定（老 run 永远跑它绑定的版本） | ✅ 实现 | A |
+| `maxStepsPerTick` 防死循环 | ✅ 实现 | A |
+| Retry 决策（可重试 → RETRYING + wake_at） | ✅ 实现（策略层测试在 C） | A |
 | `PostgresWorkflowStorage` | 🚧 桩 | B |
 | `WorkflowWorker.tick` | 🚧 桩 | C |
 | signal / cancel / delay | 🚧 桩 | D |
-| IntakeOps 集成示例 | 🚧 只能定义与注册 | E |
+| WASM handler 宿主（第三方扩展） | 💡 设计已定 | F |
+| IntakeOps 集成示例 | ✅ 走到人工审批挂起；signal 待 D | — |
 
 ```bash
 pnpm install
-pnpm check     # typecheck + 55 个测试
+pnpm check     # typecheck + 73 个测试
 pnpm build     # tsc → dist/（ESM + .d.ts）
 ```
 
@@ -147,11 +153,18 @@ Connector 市场 · Redis 依赖 · Kubernetes · 分布式 scheduler · AI Agen
 
 | Phase | 内容 | 完成标志 |
 |---|---|---|
-| **A** | Engine + StepRunner + MemoryStorage 打通 | `A → B → C` 与条件分支跑通 |
-| **B** | PostgresStorage + 版本化 + events | `kill -9` → 重启 → 继续 |
-| **C** | Retry / Timeout / Idempotency / Lease / Crash Recovery | 崩溃与重复都不出错 |
+| **A** | Engine + StepRunner + 事件流 | ✅ **已完成**：`A → B → C`、条件分支、崩溃恢复、防死循环 |
+| **B** | PostgresStorage + 版本化 + events | `kill -9` → 重启 → 继续（与 A 并行推进） |
+| **C** | Retry 端到端 / Lease 接入 / Crash Recovery / UNKNOWN 语义 | 崩溃与重复都不出错 |
 | **D** | Signal / Wait / Resume / Delay / Cancel | **Core V1 完成** |
-| **E** | 包住 IntakeOps 现有 service（不重写） | 第一个真实 dogfood |
+| **F** | WASM handler 宿主（独立扩展包） | 第三方打包一个 wasm 就能接进来 |
+
+E（包住 IntakeOps）不再单独成阶段 —— 它退化成 D 完成后的顺手验证。
+
+**为什么 wasm 是 extension 而不是 Core**：Core 只认 `StepHandler` 接口，wasm 只是它的一个宿主实现，
+所以「Core 不认识业务」这条规矩不用破；沙箱里的 IO 必须由宿主中介（capability 白名单），
+V1 的 wasm handler 建议只做纯计算（提取 / 校验 / 规则判定 / 模板渲染）。
+handler 边界刻意保持 **JSON in / JSON out**，就是为了这一天不用改 Core。
 
 详见 [docs/architecture.md](docs/architecture.md)。
 

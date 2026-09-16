@@ -59,12 +59,14 @@ export {
   WorkflowClient,
   WorkflowEngine,
 } from "./core/engine.js";
-export type { EngineLimits, StartRunOptions, WorkflowEngineOptions } from "./core/engine.js";
+export type { EngineLimits, StartRunOptions, TickOptions, TickResult, WorkflowEngineOptions } from "./core/engine.js";
 
 export {
   RESERVED_HANDLERS,
   RESERVED_HANDLER_NAMES,
   Registry,
+  assertRegistryCoverage,
+  checkRegistryCoverage,
   createRegistry,
   isReservedHandler,
 } from "./core/registry.js";
@@ -72,13 +74,17 @@ export type {
   AnyStepHandler,
   Guard,
   GuardContext,
+  GuardLookup,
   GuardResolver,
+  HandlerLookup,
+  RegistryCoverage,
   RegistryOptions,
 } from "./core/registry.js";
 
 export { StepRunner } from "./core/runner.js";
 export type {
   StepExecutionContext,
+  StepExecutionArgs,
   StepExecutionOutcome,
   StepHandler,
   StepResult,
@@ -90,6 +96,7 @@ export type { ResolveNextStepArgs } from "./core/transitions.js";
 
 // ── 错误 ────────────────────────────────────────────────────────
 export {
+  DefinitionNotFoundError,
   DuplicateRegistrationError,
   GuardNotFoundError,
   HandlerNotFoundError,

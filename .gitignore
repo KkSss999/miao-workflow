@@ -17,6 +17,9 @@ coverage/
 *.log
 .pnpm-debug.log*
 
+# npm pack
+*.tgz
+
 # tooling & OS
 .DS_Store
 .idea/

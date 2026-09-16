@@ -1,6 +1,6 @@
-# miaoworkflow
+# miao-workflow
 
-> 内部简称 **mwf** · npm 包名 `@catease/workflow`
+> 内部简称 **mwf** · npm 包名 `@catease/workflow` · Apache-2.0
 >
 > **Embedded durable workflow runtime for TypeScript.**
 
@@ -157,4 +157,7 @@ Connector 市场 · Redis 依赖 · Kubernetes · 分布式 scheduler · AI Agen
 
 ## License
 
-未定（当前 `package.json` 为 `UNLICENSED`，npm 上并未发布）。
+[Apache-2.0](LICENSE) © 2026 WenTao Ge
+
+本仓库为公开发布（https://github.com/KkSss999/miao-workflow）。
+npm 包名 `@catease/workflow` 目前**尚未发布**（`private: true`）。

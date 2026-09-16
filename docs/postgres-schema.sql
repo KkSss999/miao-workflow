@@ -1,4 +1,4 @@
--- miaoworkflow (@catease/workflow) —— PostgreSQL schema
+-- miao-workflow (@catease/workflow) —— PostgreSQL schema
 --
 -- 五张表。没有 Redis，没有独立 scheduler，没有消息队列。
 -- 并发抢占靠 workflow_runs 上的 FOR UPDATE SKIP LOCKED。

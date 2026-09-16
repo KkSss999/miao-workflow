@@ -2,9 +2,10 @@
 
 ## 项目
 
-- 名称：miaoworkflow，内部简称 **mwf**（代码 / 包名 / CLI / 分支名前缀统一 `mwf`）
-- npm 包名：`@catease/workflow`（`private: true`，**未发布**，未选定 license）
-- 仓库根：`~/Codes/5k2m/miaoworkflow`，公开仓库 https://github.com/KkSss999/miaoworkflow
+- 名称：miao-workflow（内部简称 **mwf**：代码 / 包名 / CLI / 分支名前缀统一 `mwf`）
+- npm 包名：`@catease/workflow`（`private: true`，**未发布**）
+- License：Apache-2.0，版权人 WenTao Ge（`LICENSE` + `NOTICE`，不要改成别的）
+- 仓库根：`~/Codes/5k2m/miao-workflow`，公开仓库 https://github.com/KkSss999/miao-workflow
 - 语言：TypeScript（ESM-only，Node >= 20），包管理器 **pnpm**（不要用 npm/yarn）
 - 运行时依赖：**零**。devDeps 只有 typescript / vitest / @types/node
 

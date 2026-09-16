@@ -11,14 +11,14 @@
     "human-in-the-loop",
     "typescript"
   ],
-  "license": "UNLICENSED",
-  "author": "KkSss999",
+  "license": "Apache-2.0",
+  "author": "WenTao Ge",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/KkSss999/miaoworkflow.git"
+    "url": "git+https://github.com/KkSss999/miao-workflow.git"
   },
-  "homepage": "https://github.com/KkSss999/miaoworkflow#readme",
-  "bugs": "https://github.com/KkSss999/miaoworkflow/issues",
+  "homepage": "https://github.com/KkSss999/miao-workflow#readme",
+  "bugs": "https://github.com/KkSss999/miao-workflow/issues",
   "type": "module",
   "sideEffects": false,
   "engines": {
@@ -36,6 +36,8 @@
   },
   "files": [
     "dist",
+    "LICENSE",
+    "NOTICE",
     "README.md"
   ],
   "scripts": {

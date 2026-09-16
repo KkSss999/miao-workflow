@@ -1,0 +1,27 @@
+# deps
+node_modules/
+.pnpm-store/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# build
+dist/
+build/
+.next/
+*.tsbuildinfo
+*.egg-info/
+
+# env / secrets
+.env
+.env.*
+!.env.example
+
+# tooling & OS
+.DS_Store
+.idea/
+.vscode/
+coverage/
+.artifacts/
+.pmem/pmem.db

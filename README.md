@@ -155,9 +155,25 @@ Connector 市场 · Redis 依赖 · Kubernetes · 分布式 scheduler · AI Agen
 
 详见 [docs/architecture.md](docs/architecture.md)。
 
+## 本地复用（不发布 npm）
+
+mwf **不发布到 npm**，只在本机 / 本组织内复用（`private: true` 保持不变）。
+npm 上的 `@catease/workflow` 是空的，别去那儿找。
+
+```bash
+# 在消费方项目里
+pnpm add file:../5k2m/miao-workflow
+# 或者
+pnpm link ../5k2m/miao-workflow
+```
+
+消费方 import 时照旧写包名（`@catease/workflow`）—— `file:` / `link` 会按 `package.json` 的 `name` 解析。
+
+⚠️ 引用的是构建产物：改完 mwf 记得 `pnpm build`（或 `pnpm check`），消费方才能拿到新代码。
+IntakeOps（Case 01）接入时就用这个方式，不需要任何发布流程。
+
 ## License
 
 [Apache-2.0](LICENSE) © 2026 WenTao Ge
 
-本仓库为公开发布（https://github.com/KkSss999/miao-workflow）。
-npm 包名 `@catease/workflow` 目前**尚未发布**（`private: true`）。
+不发布 npm 包，只做本地复用（见上）。

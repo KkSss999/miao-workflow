@@ -91,6 +91,7 @@ Core 只知道 `Workflow · Run · Step · Transition · Handler · Signal · Re
 | B | PostgresStorage | ✅ 五表 · JSONB 映射 · `SKIP LOCKED` 抢占；与 memory 跑同一套 conformance |
 | C | 可靠执行 | ✅ Worker 抢占循环 · lease 心跳 · 真·crash recovery · 失败隔离 · UNKNOWN 的 reconcile |
 | D | 异步与信号 | ✅ signal/wait/resume · `workflow.delay` · cancel · 等待超时 |
+| F | WASM handler 宿主 | ✅ 手搓 ABI v1 · 零依赖 · 第三方打包一个模块就接进来 |
 
 人审批可以等三天、delay 可以等两周 —— **等待期间不占进程、不挂 Promise，进程随便 kill -9**。
 
@@ -115,12 +116,12 @@ Core 只知道 `Workflow · Run · Step · Transition · Handler · Signal · Re
 | `WorkflowWorker`（抢占 · 心跳 · drain） | ✅ 实现 | C |
 | signal / wait / resume / `workflow.delay` / cancel | ✅ 实现 | D |
 | `engine.reconcile`（UNKNOWN 的人工入口） | ✅ 实现 | C |
-| WASM handler 宿主（第三方扩展） | 💡 设计已定 | F |
+| WASM handler 宿主（`@catease/workflow/wasm`） | ✅ 实现 | F |
 | IntakeOps 集成示例 | ✅ 走到人工审批挂起；signal 待 D | — |
 
 ```bash
 pnpm install
-pnpm check          # typecheck + 全部测试（含 memory conformance）
+pnpm check          # typecheck + 全部测试（含 memory conformance + wasm）
 pnpm test:postgres  # 拉一个临时 Postgres 容器，跑同一套 conformance（用完即删）
 pnpm check:all      # 上面两个都跑
 pnpm build          # tsc → dist/（ESM + .d.ts）
@@ -155,6 +156,11 @@ src/
     memory.ts          内存实现（tests / dev / demo）
     postgres.ts        PostgreSQL 适配器（五表 · JSONB · SKIP LOCKED）
     schema.ts          DDL（权威来源；docs/*.sql 是它的副本）
+  extensions/wasm/     WASM handler 宿主（子路径 @catease/workflow/wasm）
+    abi.ts             ABI v1：请求/响应编解码 + 错误码白名单
+    instance.ts        模块加载 · 校验 · 内存读写 · 护栏
+    handler.ts         → StepHandler · registerWasmHandlers
+    runtime.ts         结构性 wasm 运行时接口（不污染消费者的 lib 配置）
   worker/
     worker.ts          WorkflowWorker
     lease.ts           LeaseManager（lease + 心跳）
@@ -165,6 +171,7 @@ examples/intakeops/    第一个 dogfood 目标
 docs/
   architecture.md      设计取舍、执行语义、状态机、与三家的关系
   postgres-schema.sql  五张表（由 src/storage/schema.ts 生成，别手改）
+  wasm-abi.md          WASM handler ABI v1 规范
 ```
 
 ## 三条不能破的规矩
@@ -174,6 +181,35 @@ docs/
 2. **不宣称 exactly-once。** 承诺是 *at-least-once execution + idempotent side effects*：
    幂等键 `{runId}:{stepId}:{visit}`，外部结果未知时进入 `UNKNOWN`，**永不自动重试**。
 3. **已发布的 Definition 版本不可修改。** 内容变了就是新版本；老 run 永远跑老版本。
+
+## WASM handler（扩展，不是 Core）
+
+第三方可以**打包一个 wasm 模块、注册一个名字**就接进来：
+
+```ts
+import { Registry } from "@catease/workflow";
+import { registerWasmHandlers } from "@catease/workflow/wasm";
+
+const registry = new Registry();
+registerWasmHandlers(registry, {
+  "text.extract": await readFile("./extract.wasm"),
+  "rules.evaluate": await readFile("./rules.wasm"),
+});
+```
+
+三条边界（有测试盯着，不是口头约定）：
+
+1. **它是 extension，不是 Core。** Core 只认 `StepHandler`，wasm 只是它的一个实现 ——
+   `src/` 里除了 `extensions/wasm/` 没有任何一行 import 它，默认入口也不导出它。
+2. **IO 由宿主中介。** ABI v1 **不提供任何 host function**，所以 v1 的 wasm handler
+   只做纯计算（提取 / 校验 / 规则判定 / 模板渲染 / 格式转换）。要 IO 就显式白名单化地传 capability。
+3. **边界是 JSON in / JSON out** —— 将来换执行模式（worker_threads / 远程宿主）不用改协议。
+
+**诚实说明**：`mwf_execute` 是同步调用，模块里的死循环会阻塞事件循环，
+`StepRunner` 的超时**救不了它**。所以 v1 的定位是「有界的纯计算」；
+真要跑不可信代码，走 F.1：worker_threads 执行模式（超时 = terminate worker）。
+
+ABI 规范（含模块要求、请求/响应格式、护栏）：[docs/wasm-abi.md](docs/wasm-abi.md)
 
 ## 明确不做（V1）
 
@@ -188,7 +224,8 @@ Connector 市场 · Redis 依赖 · Kubernetes · 分布式 scheduler · AI Agen
 | **B** | PostgresStorage + 版本化 + events | ✅ **已完成**：与 memory 同一套 conformance 全绿（真容器） |
 | **C** | Retry 端到端 / Lease / Crash Recovery / UNKNOWN 语义 | ✅ **已完成** |
 | **D** | Signal / Wait / Resume / Delay / Cancel | ✅ **已完成** —— Core V1 闭环 |
-| **F** | WASM handler 宿主（独立扩展包） | 第三方打包一个 wasm 就能接进来 |
+| **F** | WASM handler 宿主（`@catease/workflow/wasm`） | ✅ **已完成**（ABI v1，零依赖，手搓测试夹具） |
+| **F.1** | worker_threads 执行模式（跑不可信模块） | 超时 = terminate worker |
 
 E（包住 IntakeOps）不再单独成阶段 —— 它已经是 `tests/examples.test.ts` 里的端到端用例
 （分类 → 人工复核 → 审批 → 建 lead → 发邮件，全程靠信号推进）。

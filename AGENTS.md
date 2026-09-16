@@ -59,20 +59,40 @@ pnpm build      # tsc → dist/
 
 ## 当前进度（新增功能时同步更新）
 
-**V1 的核心闭环已经跑通**（130 个测试；Postgres 部分需要 Docker，没有就自动跳过）。
+**V1 + Phase F 都已完成**（156 个测试；Postgres 部分需要 Docker，没有就自动跳过）。**没有桩了。**
 
 已实现：
 
 - `src/json.ts`、`src/definition/*`（归一化 / 校验 / hash / stableStringify）
-- `src/core/*`：errors / registry（含 publish 前覆盖检查）/ transitions /
-  runner（handler · JSON 校验 · 超时 · 挂起契约）/ engine（start · tick · signal · cancel ·
-  reconcile · 事件流 · 内置 handler 注册）
-- `src/runtime/*`：状态机与记录 · retry backoff · **builtins（`workflow.delay` / `workflow.complete` ·
-  手搓 duration 解析）**
+- `src/core/*`：errors / registry / transitions / runner / engine
+  （start · tick · signal · cancel · reconcile · 事件流 · 内置 handler 注册）
+- `src/runtime/*`：状态机与记录 · retry backoff · builtins（`workflow.delay` / `workflow.complete`）
 - `src/storage/*`：interface · memory · postgres · schema（DDL 权威来源）
-- `src/worker/*`：worker（抢占 · 心跳 · drain · 失败隔离）· lease · scheduler
+- `src/worker/*`：worker · lease · scheduler
+- `src/extensions/wasm/*`：WASM handler 宿主（子路径 `@catease/workflow/wasm`）
 
-**没有桩了。** 下一步是 Phase F（WASM handler 宿主，独立扩展包）与 IntakeOps 真实接入验证。
+## 框架规矩（用测试钉住的，不要破）
+
+`tests/boundary.test.ts` 守着三条：
+
+1. **Core 不 import 扩展目录** —— wasm 宿主是 extension，Core 只认 `StepHandler`
+2. **默认入口不导出 wasm** —— 它只存在于 `@catease/workflow/wasm` 子路径
+3. **`src/` 里只允许 import `node:` 内置模块与相对路径** —— 运行时零依赖，没有例外
+
+## Phase F 的约定
+
+1. **ABI 一旦发布就不能随意改**：`WASM_ABI_VERSION` 不符模块会被拒绝加载。
+   要改协议就升版本号，不要偷偷改语义（第三方模块是按旧版编译的）。
+2. **错误码白名单**：模块只能报 `STEP_FAILED` / `STEP_TIMEOUT` / `UNKNOWN_OUTCOME` /
+   `VALIDATION_ERROR` / `LIMIT_EXCEEDED` / `WORKFLOW_ERROR`，其他一律降级成 `STEP_FAILED` ——
+   模块不该能发明 Core 的语义。
+3. **默认不给任何 import**（沙箱里没有 fetch / fs / 时钟）；要能力必须显式白名单化传进去。
+4. **不引用全局 `WebAssembly` 类型**：`src/extensions/wasm/runtime.ts` 里是手搓的结构性接口。
+   理由：`WebAssembly` 的类型只在 `lib.dom` / `lib.webworker`，写它会逼消费者给 tsconfig 加 DOM lib。
+5. **同步 wasm 无法被打断**：`maxDurationMs` 只做事后审计，不是熔断。
+   要跑不可信模块只能走 F.1（worker_threads）。
+6. **测试夹具是手搓的 wasm 二进制**（`tests/support/wasm-fixtures.ts`）：机器上没有 wasm 工具链
+   （clang 没 backend、rustc 只有 wasip2 组件模型）。改 ABI 时夹具要同步改 —— 它就是协议的可执行文档。
 
 ## Phase A 定下来的语义（改之前先读懂，否则会破坏崩溃恢复）
 
@@ -96,12 +116,11 @@ pnpm build      # tsc → dist/
 2. **「是不是在挂起」看当前 step run 的 `status === 'WAITING'` + `waitFor`**，不要看 `run.status`。
 3. **挂起信息（`waitFor` / `waitPayload` / `wakeAt`）在失败与成功之后都必须保留** ——
    被信号叫醒的那次尝试失败后重试，不能再要一次信号。
-4. **signal 只写信号，不碰 run。** run 靠 `claimDue` 里的 EXISTS 条件变回可抢，
-   所以不存在「信号记下了但 run 没被叫醒」的崩溃窗口。别为了「快一点」在这里加 run 更新。
+4. **signal 只写信号，不碰 run。** run 靠 `claimDue` 里的 EXISTS 条件变回可抢。
 5. **lease 的时钟必须和 engine 同源**（`WorkflowWorker` 默认 `engine.now`）。
    多个 engine 共享同一 storage 时，注入的 `newId` 必须全局唯一（默认 randomUUID；顺序 id 会撞车）。
-6. **内存实现要守 Postgres 的约束**：外键（step run / signal / event 必须指向存在的 run）、
-   主键唯一、`idempotency_key` 唯一。两边不一致 = conformance 白写。
+6. **内存实现要守 Postgres 的约束**：外键、主键唯一、`idempotency_key` 唯一。
+   两边不一致 = conformance 白写。
 7. **顺序 = 插入顺序**：三张表用自增 `seq`，查询 `ORDER BY seq`；**绝不用随机 id 做 tiebreak**。
 8. **没有 `MWF_TEST_POSTGRES_URL` 就跳过**，不要假装测过；`pnpm test:postgres` 拉临时容器。
 
@@ -109,15 +128,16 @@ pnpm build      # tsc → dist/
 
 ```bash
 pnpm install
-pnpm check          # typecheck + 全部测试（memory conformance）
+pnpm check          # typecheck + 全部测试（memory conformance + wasm）
 pnpm test:postgres  # 临时容器跑同一套 conformance
 pnpm check:all      # 都要绿（提交前跑这个）
 pnpm build          # tsc → dist/
 pnpm schema:sync    # src/storage/schema.ts → docs/postgres-schema.sql
 ```
 
-## 下一步（Phase F：WASM handler 宿主 + 真实接入）
+## 下一步
 
-- Phase F：独立扩展包（`@catease/workflow-wasm`），Core 不动 —— handler 边界已经是 JSON in/out
-- IntakeOps 真实接入：`registry.register` 包住现有 service，触发层只调 `client.start`
-- 想加功能之前先回看 README 的「明确不做」清单
+1. **IntakeOps 真实接入**：`examples/intakeops/handlers.ts` 里注释掉的 service 调用换成真实实现
+   （编排层零改动），跑一遍真实 run
+2. **F.1**：worker_threads 执行模式（不可信 wasm 模块的超时 = terminate）
+3. 想加功能之前先回看 README 的「明确不做」清单

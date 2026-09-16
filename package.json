@@ -32,6 +32,10 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
+    "./wasm": {
+      "types": "./dist/extensions/wasm/index.d.ts",
+      "import": "./dist/extensions/wasm/index.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [

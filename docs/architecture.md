@@ -250,7 +250,8 @@ RBAC · 多租户 · Connector 市场 · Redis 依赖 · Kubernetes · 分布式
 | **B** | PostgresStorage · Run/StepRun/Events · 版本化 | `kill -9` → 重启 → 继续 | ✅ 完成 |
 | **C** | Retry 端到端 · Lease · Crash Recovery · UNKNOWN | 崩溃与重复都不出错 | ✅ 完成 |
 | **D** | Signal · Wait · Resume · Delay · Cancel | **Core V1 完成** | ✅ 完成 |
-| **F** | WASM handler 宿主（独立扩展包） | 第三方打包一个 wasm 就接进来 | 设计已定 |
+| **F** | WASM handler 宿主（`@catease/workflow/wasm`） | 第三方打包一个 wasm 就接进来 | ✅ 完成 |
+| **F.1** | worker_threads 执行模式 | 不可信模块可被 terminate | — |
 
 E（包住 IntakeOps）不再作为阶段 —— D 完成之后顺手验证即可。
 
@@ -357,7 +358,7 @@ async execute(ctx) {
 
 目标：第三方**打包一个 wasm 模块、注册一个名字**就接进来。
 
-三条约束，保证它不污染 Core：
+三条约束，保证它不污染 Core（`tests/boundary.test.ts` 盯着前两条）：
 
 1. **它是 extension，不是 Core。** Core 只认 `StepHandler` 接口；wasm 只是它的一个宿主实现
    （独立包 `@catease/workflow-wasm`）。「Core 不认识业务」这条规矩不用破。
@@ -365,7 +366,15 @@ async execute(ctx) {
    capability 函数。**V1 的 wasm handler 只做纯计算**（提取 / 校验 / 规则判定 / 模板渲染），
    天然幂等；有 IO 的继续用 TS handler。
 3. **边界保持 JSON in / JSON out。** `input` / `context` / `output` / `patch` / `error` 全是 JSON，
-   `idempotencyKey` 与 `AbortSignal` 由宿主提供 —— 这样 ABI 落地时不用动 Core。
+   `idempotencyKey` 由宿主提供 —— 这样 ABI 落地时不用动 Core。
+
+已经落地的部分：ABI v1（长度前缀响应、错误码白名单、可选 `mwf_reset`）、
+模块加载校验、内存越界与响应上限护栏、能力白名单（默认什么都不给）、
+以及一个**手搓的 wasm 二进制编码器**作为测试夹具 —— 机器上没有可用的 wasm 工具链，
+所以夹具是直接按 spec 写字节生成的（顺便成了 ABI 的可执行文档）。
+
+**已知限制（不藏）**：同步 wasm 无法被中断，死循环会阻塞事件循环，
+所以要跑不可信模块必须走 F.1（worker_threads）。
 
 ## 测试即规格
 

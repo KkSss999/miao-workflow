@@ -47,7 +47,7 @@ describe("resolveNextStep", () => {
 
   it("按声明顺序取第一个命中的分支", () => {
     const step: StepDefinition = {
-      uses: "ai.triage",
+      uses: "ai.classify",
       next: [
         { to: "manual-review", when: "confidence.low" },
         { to: "approval" },

@@ -132,8 +132,8 @@ PENDING ─→ RUNNING ─┬─→ COMPLETED
 经典事故：
 
 ```
-Send Email → Resend 成功 → 我们写 DB 之前进程 crash 💥
-重启 → step 还是 RUNNING → 不知道邮件发没发 → 再跑一次 = 重复邮件
+调用外部服务成功 → 我们写 DB 之前进程 crash 💥
+重启 → step 还是 RUNNING → 不知道对方到底做没做 → 再跑一次 = 重复副作用
 ```
 
 应对：
@@ -213,10 +213,10 @@ Email webhook、表单、Cron、Kafka、HTTP 最终都只做一件事：
 await client.start(workflowId, input);
 ```
 
-所以 Core 不需要知道什么叫 Resend：
+所以 Core 根本不需要知道外部世界是什么：
 
 ```
-Resend → IntakeOps → WorkflowClient.start() → Workflow System
+Webhook / 表单 / 定时任务 → 消费方自己的代码 → WorkflowClient.start() → Workflow System
 ```
 
 ## 与三家的关系

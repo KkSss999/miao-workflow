@@ -33,7 +33,7 @@ describe("defineWorkflow", () => {
       start: "triage",
       steps: {
         triage: {
-          uses: "ai.triage",
+          uses: "ai.classify",
           next: [{ to: "manual-review", when: "confidence.low" }, { to: "approval" }],
         },
         "manual-review": { uses: "human.review", next: "approval" },

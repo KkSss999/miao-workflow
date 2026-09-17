@@ -44,7 +44,7 @@ export interface StepMeta {
 
 /** 作者手写的 step */
 export interface StepDefinitionInput {
-  /** handler 名，例如 "ai.triage" / "human.approval" */
+  /** handler 名，例如 "ai.classify" / "human.approval" */
   uses: HandlerName;
   config?: JsonObject;
   next?: TransitionInput | TransitionInput[] | null;

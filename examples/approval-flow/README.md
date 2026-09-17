@@ -52,5 +52,7 @@ await client.signal(run.id, "approval", { decision: "approve" });
 
 ## 想看第三方扩展（wasm）怎么接？
 
-见 [`examples/wasm-handler/`](../wasm-handler/)。IntakeOps 那条 dogfood 路线已经取消 ——
-「第三方怎么接进来」这件事由 wasm 扩展来回答（Phase F）。
+见 [`examples/wasm-handler/`](../wasm-handler/)。
+
+「包一层具体业务系统」的 dogfood 路线**已取消**（那会让 Core 沾上业务概念）——
+「第三方怎么接进来」由 wasm 扩展来回答（Phase F），示例本身保持领域中立。

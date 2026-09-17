@@ -19,18 +19,18 @@ const noop: StepHandler = {
 describe("Registry", () => {
   it("注册并解析 handler", () => {
     const registry = new Registry();
-    registry.register("ai.triage", noop);
-    expect(registry.has("ai.triage")).toBe(true);
-    expect(registry.resolve("ai.triage")).toBe(noop);
-    expect(registry.handlerNames()).toEqual(["ai.triage"]);
+    registry.register("ai.classify", noop);
+    expect(registry.has("ai.classify")).toBe(true);
+    expect(registry.resolve("ai.classify")).toBe(noop);
+    expect(registry.handlerNames()).toEqual(["ai.classify"]);
   });
 
   it("支持批量注册（链式）", () => {
     const registry = new Registry().register({
-      "ai.triage": noop,
-      "lead.create": noop,
+      "ai.classify": noop,
+      "record.create": noop,
     });
-    expect(registry.handlerNames()).toEqual(["ai.triage", "lead.create"]);
+    expect(registry.handlerNames()).toEqual(["ai.classify", "record.create"]);
   });
 
   it("重名默认报错，不允许悄悄覆盖", () => {

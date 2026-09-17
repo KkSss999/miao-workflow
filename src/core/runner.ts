@@ -40,7 +40,7 @@ export interface StepExecutionContext {
 
   /**
    * 幂等键：同一次 step run 的所有 attempt 共用。
-   * 调外部 API 时请带上（Stripe / Resend 等都支持 Idempotency-Key）。
+   * 调外部 API 时请带上：支持 Idempotency-Key 的服务会据此去重。
    */
   idempotencyKey: string;
 

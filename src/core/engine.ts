@@ -97,7 +97,7 @@ interface WaitResolution {
  * 引擎 = Definition + Storage + Registry。
  *
  * 它只做这些事：发布定义、起 run、推进 run、送到信号、取消、处理未知结果。
- * 不认识 Intake / Lead / Slack / Email，也不认识 OpenAI。
+ * 它的词汇表里没有 CRM、工单、IM、邮件、模型服务这类业务概念 —— 那些都通过注册表接进来。
  */
 export class WorkflowEngine {
   readonly storage: WorkflowStorage;
@@ -752,7 +752,7 @@ export class WorkflowEngine {
  *
  * ```ts
  * const client = new WorkflowClient(engine);
- * const run = await client.start("intake-to-action", { input: { intakeId: "INT-1024" } });
+ * const run = await client.start("order-to-delivery", { input: { orderId: "ORD-1024" } });
  * await client.signal(run.id, "approval", { decision: "approve" });
  * ```
  */

@@ -31,7 +31,8 @@
 3. **已发布 Definition 版本不可修改**：同 version 不同 hash → `StorageConflictError`。改动 = 升版本。
 4. **不宣称 exactly-once**：at-least-once + 幂等副作用。
    幂等键 `{runId}:{stepId}:{visit}`；外部结果未知 → `UNKNOWN`，**永不自动重试**。
-5. **Core 不认识业务**：`src/` 里不得出现 Intake / Lead / Slack / Email / OpenAI / Resend / HubSpot。
+5. **Core 不认识业务**：`src/` 里不得出现业务词与厂商标
+   （`tests/boundary.test.ts` 会检查；示例里出现 email / approval / order 这类通用词是允许的）。
 6. **不需要 Redis**：并发只靠 `FOR UPDATE SKIP LOCKED` + lease 字段。
 7. **StepResult 只有三种**：`completed` / `waiting` / `failed`。不要加第四种。
 8. **失败是否重试由 retry policy 决定**，不由 handler 决定。
@@ -144,7 +145,7 @@ pnpm build      # tsc → dist/
 2. **执行前先写指针**，否则「已完成但没推进」这个窗口会变成重复副作用。
 3. **visit 完全由已落库的记录推导**：`(latest?.visit ?? 0) + 1`。
 4. **`input` = 上一个 COMPLETED 且 stepId 不同的 step run 的 output**；首步为 `run.input`。
-   ⚠️ 推论：**`run.input` 只有首步看得到** —— 后面都要用的东西（比如 intakeId）由首步 patch 进 context。
+   ⚠️ 推论：**`run.input` 只有首步看得到** —— 后面都要用的东西（比如业务 id）由首步 patch 进 context。
 5. **run 级事件（`workflow.*`）的 `stepId` 必须是 null**；`step.*` 才带 stepId。
 6. **撞到 `maxStepsPerTick` 不是错误**：交回队列（release lease），下一轮从 `currentStepId` 继续。
 7. **UNKNOWN 永不自动重试**；只有可重试的失败才写 RETRYING + wake_at。
@@ -207,10 +208,18 @@ pnpm build          # tsc → dist/
 pnpm schema:sync    # src/storage/schema.ts → docs/postgres-schema.sql
 ```
 
-## 下一步
+## 下一步（都在 docs/backlog.md 里）
 
-1. **IntakeOps 真实接入**：`examples/intakeops/handlers.ts` 里注释掉的 service 调用换成真实实现
-   （编排层零改动），跑一遍真实 run
-2. **可选的 V2 候选**（都还没做，也别顺手做）：并行 DAG / 子流程 / 循环 + compensation、
+1. **wasm 独立进程硬隔离**（`child_process` + rlimit）：模块跑在独立进程里才拦得住
+   `memory.grow`；协议不用改（本来就是 JSON 边界）
+2. **保留策略的自动化**：`engine.prune` 是 API，生产上要挂 cron + 冷存储归档
+3. **可选的 V2 候选**（都还没做，也别顺手做）：并行 DAG / 子流程 / 循环 + compensation、
    BullMQ worker adapter、Canvas、多租户
-3. 想加功能之前先回看 README 的「明确不做」清单
+4. 想加功能之前先回看 README 的「明确不做」清单
+
+## 两件**不要**做的事（已定的决定）
+
+- **不要再尝试把某个具体业务系统包进来当 dogfood**（历史 Phase E）。
+  它会让 Core 沾上业务概念；第三方接入由 wasm 扩展承担，
+  示例保持领域中立（`examples/approval-flow`）。
+- **不要因为「顺手」引入表达式语言、并行 DAG、Redis 依赖**（README 的「明确不做」有完整清单）。

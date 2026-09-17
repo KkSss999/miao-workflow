@@ -19,7 +19,7 @@
  * engine.registry.guard("confidence.low", ({ context }) => Number(context.confidence) < 0.75);
  *
  * const client = new WorkflowClient(engine);
- * const run = await client.start(workflow, { input: { intakeId: "INT-1024" } });
+ * const run = await client.start(workflow, { input: { orderId: "ORD-1024" } });
  * ```
  */
 

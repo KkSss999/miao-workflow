@@ -61,6 +61,35 @@ describe("架构边界", () => {
     expect(external).toEqual([]);
   });
 
+  it("src/ 里不出现业务词与厂商标（Core 不认识业务）", () => {
+    // 只禁「项目名 / 厂商名」。示例里出现 email / approval / order 这种通用业务词是正常的 ——
+    // 例子总得有个领域，但 Core 不该知道任何具体产品。
+    const banned = [
+      "IntakeOps",
+      "Intake",
+      "Lead",
+      "Slack",
+      "Resend",
+      "HubSpot",
+      "OpenAI",
+      "Stripe",
+      "Twilio",
+      "SendGrid",
+      "n8n",
+    ];
+    const offenders: string[] = [];
+
+    for (const file of sourceFiles()) {
+      const text = readFileSync(file, "utf8");
+      for (const word of banned) {
+        const pattern = new RegExp(`\\b${word}\\b`, "i");
+        if (pattern.test(text)) offenders.push(`${relative(root, file)} → ${word}`);
+      }
+    }
+
+    expect(offenders).toEqual([]);
+  });
+
   it("package.json 里没有 dependencies / peerDependencies", () => {
     const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as {
       dependencies?: Record<string, string>;

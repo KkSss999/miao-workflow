@@ -95,7 +95,7 @@ export function describeStorageConformance(title: string, harness: StorageHarnes
 
     describe("runs", () => {
       it("create / get / 局部 update 都能落地", async () => {
-        await storage.runs.create(makeRun("run-1", at(), { input: { intakeId: "INT-1" } }));
+        await storage.runs.create(makeRun("run-1", at(), { input: { orderId: "ORD-1" } }));
 
         await storage.runs.update("run-1", { status: "RUNNING", currentStepId: "a", currentStepRunId: "sr-1" });
 
@@ -103,7 +103,7 @@ export function describeStorageConformance(title: string, harness: StorageHarnes
         expect(run?.status).toBe("RUNNING");
         expect(run?.currentStepId).toBe("a");
         expect(run?.currentStepRunId).toBe("sr-1");
-        expect(run?.input).toEqual({ intakeId: "INT-1" });
+        expect(run?.input).toEqual({ orderId: "ORD-1" });
         // 没被 patch 到的字段不能丢
         expect(run?.workflowId).toBe("test-workflow");
         expect(run?.createdAt).toBe(at());
@@ -476,7 +476,7 @@ export function describeStorageConformance(title: string, harness: StorageHarnes
           },
         });
 
-        const run = await engine.start(linear, { input: { intakeId: "INT-1" } });
+        const run = await engine.start(linear, { input: { orderId: "ORD-1" } });
         const result = await engine.tick(run.id);
 
         expect(result).toEqual({ steps: 3, status: "COMPLETED" });

@@ -91,7 +91,7 @@ describe("Phase A: 顺序执行", () => {
       "test.c": handler(() => ({ status: "completed", patch: { c: 3 } })),
     });
 
-    const run = await engine.start(linear, { input: { intakeId: "INT-1" } });
+    const run = await engine.start(linear, { input: { orderId: "ORD-1" } });
     expect(run.status).toBe("CREATED");
     expect(run.currentStepId).toBe("a");
     expect(run.currentStepRunId).toBeNull();
@@ -110,11 +110,11 @@ describe("Phase A: 顺序执行", () => {
     const stepRuns = await storage.steps.listByRun(run.id);
     expect(stepRuns.map((item) => item.stepId)).toEqual(["a", "b", "c"]);
     // 首个 step 的 input 是 run.input，之后的 input 是上一步的 output
-    expect(stepRuns[0]?.input).toEqual({ intakeId: "INT-1" });
-    expect(stepRuns[1]?.input).toEqual({ from: "a", gotInput: { intakeId: "INT-1" } });
+    expect(stepRuns[0]?.input).toEqual({ orderId: "ORD-1" });
+    expect(stepRuns[1]?.input).toEqual({ from: "a", gotInput: { orderId: "ORD-1" } });
     expect(stepRuns[1]?.output).toEqual({
       from: "b",
-      sawA: { from: "a", gotInput: { intakeId: "INT-1" } },
+      sawA: { from: "a", gotInput: { orderId: "ORD-1" } },
       sawPatch: 1,
     });
   });
@@ -296,7 +296,7 @@ describe("Phase A: 崩溃恢复不重放副作用", () => {
       }),
     });
 
-    const run = await h.engine.start(linear, { input: { intakeId: "INT-1" } });
+    const run = await h.engine.start(linear, { input: { orderId: "ORD-1" } });
 
     // 造出崩溃现场：A 已经落库成功，但 run 还没推进（context 也还没写）
     const at = "2026-01-01T00:00:00.000Z";
@@ -308,7 +308,7 @@ describe("Phase A: 崩溃恢复不重放副作用", () => {
       attempt: 1,
       failures: 0,
       visit: 1,
-      input: { intakeId: "INT-1" },
+      input: { orderId: "ORD-1" },
       output: { from: "a" },
       patch: { a: 1 },
       error: null,

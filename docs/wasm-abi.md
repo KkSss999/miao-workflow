@@ -121,6 +121,11 @@ worker 里**没有 IO 能力**：线程入口只做 WebAssembly 调用，不暴�
 也不接受模块的 import（除非宿主显式白名单化地传）。所以「独立线程」是隔离与可中断，
 不是提权。
 
+## 现成的例子
+
+- `examples/wasm-handler/`：从磁盘加载一个真 `.wasm` 文件并注册（含 Rust 骨架与最小模块）
+- `tests/wasm-example.test.ts`：那条链路的回归测试（文件 ↔ 编码器漂移、inline / worker 两种模式）
+
 ## 一个 fixture 长什么样
 
 `tests/support/wasm-fixtures.ts` 里有一个**手搓的 wasm 二进制编码器**（不装任何工具链），

@@ -12,8 +12,8 @@ import type { StepHandler } from "./runner.js";
 /**
  * Core 不认识业务。
  *
- * 它只知道 handler 名和 guard 名；"ai.triage" / "lead.create" 这些名字背后的东西
- * 由使用方（IntakeOps / DocumentOps / …）自己注册。
+ * 它只知道 handler 名和 guard 名；"ai.classify" / "record.create" 这些名字背后的东西
+ * 由使用方自己注册。
  */
 
 export interface GuardContext {

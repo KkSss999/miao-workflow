@@ -21,7 +21,7 @@ BullMQ 擅长 job / retry / delay / worker；XState 擅长状态机与 Actor。
 
 ```
 ┌─────────────────────────────────────┐
-│      Consumer Application           │   IntakeOps / DocumentOps / …
+│      Consumer Application           │   任意 Node/TS 后端
 │  Email / API / UI / Domain Logic    │
 └─────────────────┬───────────────────┘
                   │  registry.register("email.send", handler)
@@ -48,17 +48,17 @@ Core 的词汇表只有：
 Workflow · Run · Step · Transition · Handler · Signal · Retry · Wait
 ```
 
-不存在 `Intake` / `Lead` / `Slack` / `Email` / `OpenAI` / `HubSpot`。
+不存在 CRM、工单、IM、邮件、模型服务这类业务概念，也不存在任何厂商名。
 业务通过注册表接进来：
 
 ```ts
-registry.register("ai.triage", triageHandler);
-registry.register("lead.create", leadHandler);
+registry.register("ai.classify", classifyHandler);
+registry.register("record.create", recordHandler);
 registry.register("email.send", emailHandler);
 ```
 
-同一个 Runtime 之后会被 Case 02（DocumentOps）、Case 03（KnowledgeOps）复用。
-这就是把它抽出来的理由。
+同一个 Runtime 因此可以被完全不同的业务复用 —— 这就是把它单独抽出来的理由。
+`tests/boundary.test.ts` 会检查 `src/` 里不出现业务词与厂商标。
 
 ## Definition 层
 
@@ -235,7 +235,7 @@ Resend → IntakeOps → WorkflowClient.start() → Workflow System
 **必须有**：TypeScript · JSON definition · Handler Registry · 顺序执行 · 条件分支 ·
 持久化 run / step run · Postgres + Memory adapter · 版本化 · Retry + backoff · Timeout ·
 幂等键 · Worker lease · crash recovery · Wait · Signal/Resume · Delay · Cancel ·
-Audit events · UNKNOWN · IntakeOps 集成示例 · 完整测试
+Audit events · UNKNOWN · 端到端示例（examples/）· 完整测试
 
 **明确不做**：Canvas · n8n import · 并行 DAG · 循环 · 子流程 · Expression Language ·
 RBAC · 多租户 · Connector 市场 · Redis 依赖 · Kubernetes · 分布式 scheduler · AI Agent framework
@@ -252,7 +252,8 @@ RBAC · 多租户 · Connector 市场 · Redis 依赖 · Kubernetes · 分布式
 | **D** | Signal · Wait · Resume · Delay · Cancel | **Core V1 完成** | ✅ 完成 |
 | **F** | WASM handler 宿主（`@catease/workflow/wasm`） | 第三方打包一个 wasm 就接进来，含线程隔离执行模式 | ✅ 完成 |
 
-E（包住 IntakeOps）不再作为阶段 —— D 完成之后顺手验证即可。
+E（包住某个真实业务系统）**不做**：这会让 Core 沾上具体业务。
+第三方接入的答案是 wasm 扩展（Phase F）—— 模块由对方编译，通过 `StepHandler` 接进来。
 
 ## 两个适配器，一套断言
 

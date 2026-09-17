@@ -15,32 +15,32 @@ import {
  *   2. 做完之后 context 怎么变（通过 patch）
  */
 
-export interface TriageOutput {
+export interface ClassifyOutput {
   confidence: number;
   priority: "high" | "normal";
   summary: string;
 }
 
 /**
- * AI 分类。带重试的步骤必须幂等（这里只是读输入 + 写 context，天然幂等）。
+ * 分类。带重试的步骤必须幂等（这里只是读输入 + 写 context，天然幂等）。
  *
  * 注意一个约定：**run.input 只有首个 step 看得到**（后面的 step，input 是上一步的 output）。
- * 所以首个 step 应该把「后面都要用的东西」patch 进 context —— 这里就是 intakeId。
+ * 所以首个 step 应该把「后面都要用的东西」patch 进 context —— 这里就是 requestId。
  */
-export const triageHandler: StepHandler<{ model?: string }, TriageOutput> = {
+export const classifyHandler: StepHandler<{ model?: string }, ClassifyOutput> = {
   async execute(context, config) {
-    const model = config?.model ?? "deepseek-flash";
-    const intakeId = readIntakeId(context.input);
+    const requestId = readRequestId(context.input);
 
-    // 真实实现：await triageService.classify({ intakeId, model })
-    const confidence = model.includes("flash") ? 0.62 : 0.91;
+    // 真实实现：await classifyService.run({ requestId, model: config?.model })
+    // 示例里假装模型只给了 0.62 的置信度 → 会被 "confidence.low" 这个 guard 分流到人工复核
+    const confidence = config?.model === "precise" ? 0.91 : 0.62;
     const priority = confidence > 0.8 ? "normal" : "high";
 
     return {
       status: "completed",
-      output: { confidence, priority, summary: `${intakeId} 的请求已完成分类` },
+      output: { confidence, priority, summary: `${requestId} 已完成分类` },
       // patch 会合并进 context，供后续 guard 与 step 读取
-      patch: { intakeId, confidence, priority },
+      patch: { requestId, confidence, priority },
     };
   },
 };
@@ -74,55 +74,55 @@ export const approvalHandler: StepHandler = {
   },
 };
 
-/** 建 lead：把现有 LeadService 包一层，不重写业务逻辑。 */
-export const leadHandler: StepHandler<{ source: string }> = {
+/** 建记录：把现有 service 包一层，不重写业务逻辑。 */
+export const recordHandler: StepHandler<{ source: string }> = {
   async execute(ctx, config) {
-    // intakeId 是首个 step patch 进 context 的（不是从 input 来的，input 是上一步的 output）
-    const intakeId = typeof ctx.context["intakeId"] === "string" ? ctx.context["intakeId"] : "unknown-intake";
+    // requestId 是首个 step patch 进 context 的（不是从 input 来的，input 是上一步的 output）
+    const requestId = typeof ctx.context["requestId"] === "string" ? ctx.context["requestId"] : "unknown";
 
-    // 真实实现：const lead = await leadService.create({ intakeId, source: config.source })
-    const leadId = `lead_${intakeId}`;
+    // 真实实现：const record = await recordService.create({ requestId, source: config.source })
+    const recordId = `rec_${requestId}`;
 
     return {
       status: "completed",
-      output: { leadId },
-      patch: { leadId, source: config?.source ?? "intakeops" },
+      output: { recordId },
+      patch: { recordId, source: config?.source ?? "example" },
     };
   },
 };
 
-/** 发邮件：副作用步骤的教科书做法 —— 幂等键 + UNKNOWN。 */
+/** 发通知：副作用步骤的教科书做法 —— 幂等键 + UNKNOWN。 */
 export const emailHandler: StepHandler<{ to: string; subject?: string }> = {
   async execute(context, config) {
     try {
-      // 真实实现：await resend.emails.send(payload, { idempotencyKey: context.idempotencyKey })
+      // 真实实现：await emailClient.send(payload, { idempotencyKey: context.idempotencyKey })
       // 同一次 step run 的所有 attempt 共用同一个 key，重试不会重复投递
       const emailId = `email_${context.idempotencyKey}`;
-      return { status: "completed", output: { emailId, to: config?.to ?? "unknown@example.com" } };
+      return { status: "completed", output: { emailId, to: config?.to ?? "ops@example.com" } };
     } catch (error) {
       if (isTimeout(error)) {
         // 超时 ≠ 失败：对方可能已经发出去了。
-        // 自动重试会造成重复发信，所以走 reconciliation，而不是 retry。
-        return { status: "failed", error: new UnknownOutcomeError("邮件投递结果未知", { cause: error }) };
+        // 自动重试会造成重复投递，所以走 reconciliation，而不是 retry。
+        return { status: "failed", error: new UnknownOutcomeError("通知投递结果未知", { cause: error }) };
       }
-      // 明确失败（4xx）→ 允许按 retry policy 重试
+      // 明确失败 → 允许按 retry policy 重试
       return { status: "failed", error: toWorkflowError(error, { code: "STEP_FAILED", retryable: true }) };
     }
   },
 };
 
 /**
- * IntakeOps 的注册入口 —— 应用启动时调一次。
+ * 接入入口 —— 应用启动时调一次。
  *
  * 这就是 Core 与应用的全部接缝：一个 handler 表 + 一个 guard 表。
  */
-export function registerIntakeOps(registry: Registry = new Registry()): Registry {
+export function registerApprovalFlow(registry: Registry = new Registry()): Registry {
   return registry
     .register({
-      "ai.triage": triageHandler,
+      "ai.classify": classifyHandler,
       "human.review": manualReviewHandler,
       "human.approval": approvalHandler,
-      "lead.create": leadHandler,
+      "record.create": recordHandler,
       "email.send": emailHandler,
     })
     .guard({
@@ -137,10 +137,10 @@ function reviewerOf(payload: JsonValue | undefined): string {
   return typeof reviewer === "string" ? reviewer : "unknown";
 }
 
-function readIntakeId(input: JsonValue | undefined): string {
-  if (typeof input !== "object" || input === null || Array.isArray(input)) return "unknown-intake";
-  const intakeId = input["intakeId"];
-  return typeof intakeId === "string" ? intakeId : "unknown-intake";
+function readRequestId(input: JsonValue | undefined): string {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return "unknown-request";
+  const requestId = input["requestId"];
+  return typeof requestId === "string" ? requestId : "unknown-request";
 }
 
 function isTimeout(error: unknown): boolean {

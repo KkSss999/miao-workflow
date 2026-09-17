@@ -31,7 +31,7 @@ function registerApproval(h: ReturnType<typeof createHarness>): void {
 
 /** 走一遍「起 run → 跑到挂起」 */
 async function runUntilWaiting(h: ReturnType<typeof createHarness>) {
-  const run = await h.engine.start(approvalFlow, { input: { intakeId: "INT-1024" } });
+  const run = await h.engine.start(approvalFlow, { input: { orderId: "ORD-1024" } });
   await h.worker.tick();
   return run;
 }

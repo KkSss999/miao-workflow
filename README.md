@@ -29,18 +29,18 @@ import {
 } from "@catease/workflow";
 
 const workflow = defineWorkflow({
-  id: "intake-to-action",
+  id: "order-to-delivery",
   version: 1,
   start: "triage",
   steps: {
-    triage: {
-      uses: "ai.triage",
+    classify: {
+      uses: "ai.classify",
       next: [{ to: "manual-review", when: "confidence.low" }, { to: "approval" }],
     },
     "manual-review": { uses: "human.review", next: "approval" },
-    approval: { uses: "human.approval", next: "create-lead" },
-    "create-lead": { uses: "lead.create", next: "send-email" },
-    "send-email": { uses: "email.send" }, // 没有 next = 终点
+    approval: { uses: "human.approval", next: "create-record" },
+    "create-record": { uses: "record.create", next: "notify" },
+    notify: { uses: "email.send" }, // 没有 next = 终点
   },
 });
 
@@ -49,10 +49,10 @@ const engine = new WorkflowEngine({ storage });
 
 engine.registry
   .register({
-    "ai.triage": triageHandler,
+    "ai.classify": classifyHandler,
     "human.review": reviewHandler,
     "human.approval": approvalHandler,
-    "lead.create": leadHandler,
+    "record.create": recordHandler,
     "email.send": emailHandler,
   })
   .guard("confidence.low", ({ context }) => Number(context["confidence"] ?? 1) < 0.75);
@@ -60,7 +60,7 @@ engine.registry
 const client = new WorkflowClient(engine);
 const worker = new WorkflowWorker({ engine, concurrency: 16 });
 
-const run = await client.start(workflow, { input: { intakeId: "INT-1024" } });
+const run = await client.start(workflow, { input: { orderId: "ORD-1024" } });
 worker.start();                                   // 后台轮询推进
 
 // 几天后人类点了 Approve（web 请求里只写一条信号，不执行任何业务）
@@ -81,8 +81,9 @@ const approvalHandler: StepHandler = {
 };
 ```
 
-定义里**没有一个字**提到 Resend / HubSpot / Slack / OpenAI。
-Core 只知道 `Workflow · Run · Step · Transition · Handler · Signal · Retry · Wait`。
+定义里**没有一个字**提到具体的 CRM / 邮件服务 / IM / 模型厂商。
+Core 的词汇表只有 `Workflow · Run · Step · Transition · Handler · Signal · Retry · Wait` ——
+业务概念一律通过注册表接进来（`tests/boundary.test.ts` 会检查 src/ 里没有业务词与厂商标）。
 
 ## 状态
 
@@ -131,7 +132,8 @@ await engine.prune({ before: new Date(Date.now() - 30 * 86_400_000).toISOString(
 | `engine.reconcile`（FAILED / UNKNOWN 的人工入口） | ✅ 实现 | C |
 | `engine.prune`（保留策略：只删终态旧 run） | ✅ 实现 | — |
 | WASM handler 宿主（`@catease/workflow/wasm`） | ✅ 实现 | F |
-| IntakeOps 集成示例 | ✅ 走到人工审批挂起；signal 待 D | — |
+| `examples/approval-flow`（人工审批端到端示例） | ✅ 23 条审计事件的链路测试 | — |
+| `examples/wasm-handler`（从磁盘加载第三方 wasm 模块） | ✅ 实现 | F |
 
 ```bash
 pnpm install
@@ -184,7 +186,9 @@ src/
     scheduler.ts       轮询调度（不用分布式 scheduler）
 tests/
   support/             共用的 storage 夹具 + conformance 套件
-examples/intakeops/    第一个 dogfood 目标
+examples/
+  approval-flow/       人工审批端到端示例（同时是链路测试）
+  wasm-handler/        第三方模块示例（含一个可审计的 echo.wasm）
 docs/
   architecture.md      设计取舍、执行语义、状态机、与三家的关系
   postgres-schema.sql  五张表（由 src/storage/schema.ts 生成，别手改）
@@ -268,8 +272,9 @@ Connector 市场 · Redis 依赖 · Kubernetes · 分布式 scheduler · AI Agen
 | **D** | Signal / Wait / Resume / Delay / Cancel | ✅ **已完成** —— Core V1 闭环 |
 | **F** | WASM handler 宿主（`@catease/workflow/wasm`） | ✅ **已完成**（ABI v1，零依赖，手搓测试夹具） |
 
-E（包住 IntakeOps）不再单独成阶段 —— 它已经是 `tests/examples.test.ts` 里的端到端用例
-（分类 → 人工复核 → 审批 → 建 lead → 发邮件，全程靠信号推进）。
+E（包住某个真实业务系统）**不做了** —— 「第三方怎么接进来」这个问题由 wasm 扩展回答（Phase F）：
+示例端到端流程留在 `examples/approval-flow`（它是中立领域的，同时充当链路测试），
+第三方模块的接入路径见 `examples/wasm-handler`。
 
 **为什么 wasm 是 extension 而不是 Core**：Core 只认 `StepHandler` 接口，wasm 只是它的一个宿主实现，
 所以「Core 不认识业务」这条规矩不用破；沙箱里的 IO 必须由宿主中介（capability 白名单），
@@ -293,7 +298,7 @@ pnpm link ../5k2m/miao-workflow
 消费方 import 时照旧写包名（`@catease/workflow`）—— `file:` / `link` 会按 `package.json` 的 `name` 解析。
 
 ⚠️ 引用的是构建产物：改完 mwf 记得 `pnpm build`（或 `pnpm check`），消费方才能拿到新代码。
-IntakeOps（Case 01）接入时就用这个方式，不需要任何发布流程。
+消费方项目用这个方式接入就行，不需要任何发布流程。
 
 ## License
 

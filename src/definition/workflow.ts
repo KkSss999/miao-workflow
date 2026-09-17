@@ -33,14 +33,14 @@ export interface WorkflowDefinition {
  *
  * ```ts
  * const workflow = defineWorkflow({
- *   id: "intake-to-action",
+ *   id: "order-to-delivery",
  *   version: 1,
- *   start: "triage",
+ *   start: "classify",
  *   steps: {
- *     triage: { uses: "ai.triage", next: "approval" },
- *     approval: { uses: "human.approval", next: "create-lead" },
- *     "create-lead": { uses: "lead.create", next: "send-email" },
- *     "send-email": { uses: "email.send" }, // 没有 next = 终点
+ *     classify: { uses: "ai.classify", next: "approval" },
+ *     approval: { uses: "human.approval", next: "create-record" },
+ *     "create-record": { uses: "record.create", next: "notify" },
+ *     notify: { uses: "email.send" }, // 没有 next = 终点
  *   },
  * });
  * ```
